@@ -425,6 +425,92 @@ impl Unit {
         parts.next(); // skip name
         parts.next() // return version
     }
+
+    /// Computes a unique identity hash for this unit.
+    ///
+    /// The identity is a SHA-256 hash of (pkg_id, sorted features, profile key fields, mode, target name, crate types).
+    /// This can be used as a unique derivation key since the same package can appear
+    /// multiple times with different features or profiles.
+    ///
+    /// Returns a 16-character hex string (first 64 bits of SHA-256).
+    pub fn identity_hash(&self) -> String {
+        use sha2::Digest as _;
+
+        let mut hasher = sha2::Sha256::new();
+
+        // Package identity
+        hasher.update(self.pkg_id.as_bytes());
+        hasher.update(b"\0");
+
+        // Target name and crate types (same pkg can have multiple targets)
+        hasher.update(self.target.name.as_bytes());
+        hasher.update(b"\0");
+        for ct in &self.target.crate_types {
+            hasher.update(ct.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Sorted features for determinism
+        let mut features = self.features.clone();
+        features.sort();
+        for feature in &features {
+            hasher.update(feature.as_bytes());
+            hasher.update(b"\0");
+        }
+
+        // Profile fields that affect compilation output
+        hasher.update(self.profile.name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.profile.opt_level.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", self.profile.lto).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", self.profile.debuginfo).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", self.profile.panic).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(if self.profile.debug_assertions {
+            b"1"
+        } else {
+            b"0"
+        });
+        hasher.update(if self.profile.overflow_checks {
+            b"1"
+        } else {
+            b"0"
+        });
+
+        // Codegen units (affects output)
+        if let Some(cgu) = self.profile.codegen_units {
+            hasher.update(cgu.to_string().as_bytes());
+        }
+        hasher.update(b"\0");
+
+        // Build mode
+        hasher.update(self.mode.as_bytes());
+        hasher.update(b"\0");
+
+        // Platform (proc-macros compile for host)
+        if let Some(ref platform) = self.platform {
+            hasher.update(platform.as_bytes());
+        }
+        hasher.update(b"\0");
+
+        // Take first 8 bytes (16 hex chars) for a reasonably unique short ID
+        let result = hasher.finalize();
+        hex::encode(&result[..8])
+    }
+
+    /// Returns a Nix-safe derivation name for this unit.
+    ///
+    /// Format: `{crate_name}-{version}-{identity_hash}`
+    /// Example: `serde-1.0.219-a1b2c3d4e5f67890`
+    pub fn derivation_name(&self) -> String {
+        let name = &self.target.name;
+        let version = self.package_version().unwrap_or("0.0.0");
+        let hash = self.identity_hash();
+        format!("{name}-{version}-{hash}")
+    }
 }
 
 impl UnitGraph {
@@ -716,5 +802,216 @@ mod tests {
         assert!(unit.is_build_script());
         assert!(!unit.is_lib());
         assert!(!unit.is_bin());
+    }
+
+    #[test]
+    fn test_identity_hash_deterministic() {
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "my-package 0.1.0 (path+file:///test)",
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "name": "my_package",
+                        "src_path": "/test/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {
+                        "name": "dev",
+                        "opt_level": "0"
+                    },
+                    "features": ["default", "std"],
+                    "mode": "build",
+                    "dependencies": []
+                }
+            ],
+            "roots": [0]
+        }"#;
+
+        let graph: UnitGraph = serde_json::from_str(json).expect("failed to parse");
+        let unit = &graph.units[0];
+
+        // Hash should be deterministic
+        let hash1 = unit.identity_hash();
+        let hash2 = unit.identity_hash();
+        assert_eq!(hash1, hash2);
+
+        // Hash should be 16 hex chars (8 bytes)
+        assert_eq!(hash1.len(), 16);
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_identity_hash_feature_order_independent() {
+        // Features in different order should produce same hash
+        let json1 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": ["a", "b", "c"],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let json2 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": ["c", "a", "b"],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph1: UnitGraph = serde_json::from_str(json1).expect("failed to parse");
+        let graph2: UnitGraph = serde_json::from_str(json2).expect("failed to parse");
+
+        assert_eq!(
+            graph1.units[0].identity_hash(),
+            graph2.units[0].identity_hash()
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_differs_by_features() {
+        let json1 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": ["std"],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let json2 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": ["std", "alloc"],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph1: UnitGraph = serde_json::from_str(json1).expect("failed to parse");
+        let graph2: UnitGraph = serde_json::from_str(json2).expect("failed to parse");
+
+        assert_ne!(
+            graph1.units[0].identity_hash(),
+            graph2.units[0].identity_hash()
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_differs_by_profile() {
+        let json1 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let json2 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "release", "opt_level": "3"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph1: UnitGraph = serde_json::from_str(json1).expect("failed to parse");
+        let graph2: UnitGraph = serde_json::from_str(json2).expect("failed to parse");
+
+        assert_ne!(
+            graph1.units[0].identity_hash(),
+            graph2.units[0].identity_hash()
+        );
+    }
+
+    #[test]
+    fn test_identity_hash_differs_by_mode() {
+        let json1 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let json2 = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///test)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "test", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "test",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph1: UnitGraph = serde_json::from_str(json1).expect("failed to parse");
+        let graph2: UnitGraph = serde_json::from_str(json2).expect("failed to parse");
+
+        assert_ne!(
+            graph1.units[0].identity_hash(),
+            graph2.units[0].identity_hash()
+        );
+    }
+
+    #[test]
+    fn test_derivation_name() {
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "serde 1.0.219 (registry+https://github.com/rust-lang/crates.io-index)",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "serde", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": ["default", "std"],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph: UnitGraph = serde_json::from_str(json).expect("failed to parse");
+        let unit = &graph.units[0];
+
+        let name = unit.derivation_name();
+        assert!(name.starts_with("serde-1.0.219-"));
+        assert_eq!(name.len(), "serde-1.0.219-".len() + 16); // 16 hex chars
     }
 }

@@ -124,3 +124,38 @@ Same package can appear multiple times with different features. Use hash of (pkg
 
 ### Extern Crate Names
 Dependency's `extern_crate_name` may differ from crate name (e.g., `serde_derive` -> `serde`). Always use the provided name.
+
+## From feature #1
+
+### Polymorphic JSON Fields
+Cargo's unit-graph JSON has fields that can be multiple types:
+- `lto`: bool (`false`/`true`) OR string (`"thin"`/`"fat"`/`"off"`)
+- `debuginfo`: int (`0`/`1`/`2`) OR string (`"none"`/`"limited"`/`"full"`/`"line-tables-only"`)
+- `strip`: bool OR string (`"none"`/`"debuginfo"`/`"symbols"`)
+
+Use custom `serde::Deserialize` with `deserialize_any` and visitor pattern:
+```rust
+impl<'de> serde::Deserialize<'de> for LtoSetting {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where D: serde::Deserializer<'de> {
+        struct LtoVisitor;
+        impl serde::de::Visitor<'_> for LtoVisitor {
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> { ... }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> { ... }
+        }
+        deserializer.deserialize_any(LtoVisitor)
+    }
+}
+```
+
+### Unit Helper Methods
+`Unit` has helpers for detection:
+- `is_build_script()` - checks `mode == "run-custom-build"` or `kind.contains("custom-build")`
+- `is_proc_macro()` - checks `kind.contains("proc-macro")`
+- `is_lib()` / `is_bin()` / `is_test()` - check target kind
+- `package_name()` / `package_version()` - parse from `pkg_id`
+
+### Default Values
+- `target.test`, `target.doctest`, `target.doc` default to `true`
+- `profile.panic` defaults to `Unwind`
+- Most profile options default to `false` or `None`

@@ -1,6 +1,6 @@
 meta:
   started: 2026-01-14T00:00:00Z
-  iterations: 0
+  iterations: 1
 
 features:
   # Phase 1: Core Unit Graph Parsing (foundation)
@@ -9,7 +9,7 @@ features:
     depends_on: []
     relevant_files:
       - "@src/unit_graph.rs"
-    status: in_progress
+    status: done
     block_count: 0
 
   - id: 2
@@ -17,7 +17,7 @@ features:
     depends_on: [1]
     relevant_files:
       - "@src/unit_graph.rs"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 3
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 0
+  done: 1
   blocked: 0
   total: 17
