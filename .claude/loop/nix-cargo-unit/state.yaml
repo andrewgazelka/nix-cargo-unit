@@ -46,7 +46,7 @@ features:
       - "@src/nix_gen.rs"
       - "@src/lib.rs"
       - "@src/unit_graph.rs"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 6

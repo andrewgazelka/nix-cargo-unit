@@ -1,5 +1,6 @@
 use std::io::Read as _;
 
+use nix_cargo_unit::nix_gen::{NixGenConfig, NixGenerator};
 use nix_cargo_unit::unit_graph;
 
 #[derive(clap::Parser)]
@@ -9,6 +10,10 @@ struct Cli {
     /// Output format: nix or json
     #[arg(short, long, default_value = "nix")]
     format: String,
+
+    /// Workspace root path for source remapping
+    #[arg(short, long, default_value = ".")]
+    workspace_root: String,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -24,7 +29,12 @@ fn main() -> color_eyre::Result<()> {
 
     match cli.format.as_str() {
         "nix" => {
-            let nix = graph.to_nix();
+            let config = NixGenConfig {
+                workspace_root: cli.workspace_root,
+                content_addressed: false,
+            };
+            let generator = NixGenerator::new(config);
+            let nix = generator.generate(&graph);
             println!("{nix}");
         }
         "json" => {
