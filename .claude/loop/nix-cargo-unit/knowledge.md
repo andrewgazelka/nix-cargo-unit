@@ -159,3 +159,20 @@ impl<'de> serde::Deserialize<'de> for LtoSetting {
 - `target.test`, `target.doctest`, `target.doc` default to `true`
 - `profile.panic` defaults to `Unwind`
 - Most profile options default to `false` or `None`
+
+## From feature #2
+
+### Unit Identity Hash
+`Unit::identity_hash()` computes a SHA-256 hash (first 8 bytes, 16 hex chars) from:
+- `pkg_id` - package identity
+- `target.name` + `crate_types` - distinguishes multiple targets in same pkg
+- `features` (sorted) - different feature sets = different compilation
+- `profile.name`, `opt_level`, `lto`, `debuginfo`, `panic`, `debug_assertions`, `overflow_checks`, `codegen_units`
+- `mode` - build vs test vs check
+- `platform` - host platform for proc-macros
+
+### Derivation Naming
+`Unit::derivation_name()` returns `{crate_name}-{version}-{identity_hash}`.
+Example: `serde-1.0.219-a1b2c3d4e5f67890`
+
+This ensures unique derivation names even when the same crate appears multiple times with different features/profiles.

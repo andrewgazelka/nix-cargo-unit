@@ -1,6 +1,6 @@
 use std::io::Read as _;
 
-mod unit_graph;
+use nix_cargo_unit::unit_graph;
 
 #[derive(clap::Parser)]
 #[command(name = "nix-cargo-unit")]
