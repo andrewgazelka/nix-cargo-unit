@@ -9,7 +9,7 @@ features:
     depends_on: []
     relevant_files:
       - "@src/unit_graph.rs"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 2
