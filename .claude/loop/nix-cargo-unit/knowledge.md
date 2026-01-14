@@ -8,9 +8,9 @@ Workers read this FIRST before exploring.
 |------|---------|
 | `@src/main.rs` | CLI entry point - reads unit-graph JSON from stdin, outputs Nix or JSON |
 | `@src/unit_graph.rs` | Unit graph types (UnitGraph, Unit, Target, Profile, Dependency) and Nix codegen |
-| `@src/lib.rs` | Library exports (to be created) |
-| `@src/rustc_flags.rs` | Rustc flag reconstruction from unit metadata (to be created) |
-| `@src/source_filter.rs` | Source file filtering per crate (to be created) |
+| `@src/lib.rs` | Library exports - exposes unit_graph and rustc_flags modules |
+| `@src/rustc_flags.rs` | RustcFlags builder - generates rustc CLI args from unit metadata |
+| `@src/source_filter.rs` | Source location parsing, path remapping, Nix fileset generation |
 | `@src/nix_gen.rs` | Nix derivation code generation (to be created) |
 | `@src/build_script.rs` | Build script handling (to be created) |
 | `@src/proc_macro.rs` | Proc-macro host compilation (to be created) |
@@ -176,3 +176,69 @@ impl<'de> serde::Deserialize<'de> for LtoSetting {
 Example: `serde-1.0.219-a1b2c3d4e5f67890`
 
 This ensures unique derivation names even when the same crate appears multiple times with different features/profiles.
+
+## From feature #3
+
+### RustcFlags Builder
+`RustcFlags::from_unit(&unit)` generates all rustc flags from unit metadata:
+- `--crate-name`, `--edition`, `--crate-type`
+- `-C opt-level`, `-C debuginfo`, `-C lto`, `-C panic`, `-C strip`
+- `-C debug-assertions`, `-C overflow-checks`, `-C codegen-units`
+- `--cfg feature="..."` for each feature
+- `--test` flag for test mode
+
+Does NOT include `--extern` or `-L` flags - those must be added separately based on dependency graph.
+
+### Adding Dependencies
+```rust
+let mut flags = RustcFlags::from_unit(&unit);
+flags.add_extern("serde", "/nix/store/abc/lib/libserde.rlib");
+flags.add_lib_path("/nix/store/abc/lib");
+flags.add_source(&unit.target.src_path);
+flags.add_output("$out/lib.rlib");
+```
+
+### Shell Output
+`flags.to_shell_string()` returns a properly-escaped shell command string.
+Arguments with spaces/quotes are single-quoted with proper escaping.
+
+## From feature #4
+
+### Source Location Parsing
+`SourceLocation::from_unit(&unit)` extracts source information from pkg_id and src_path:
+- `name`, `version` - parsed from pkg_id
+- `source` - `SourceType::Path`, `SourceType::Registry`, or `SourceType::Git`
+- `crate_root` - absolute path to crate directory (contains Cargo.toml)
+- `entry_point` - relative path to entry point from crate root (e.g., "src/lib.rs")
+
+### pkg_id Format
+Format: `"name version (source-type+url)"`
+- Path: `"my-crate 0.1.0 (path+file:///home/user/project)"`
+- Registry: `"serde 1.0.219 (registry+https://github.com/rust-lang/crates.io-index)"`
+- Git: `"dep 0.1.0 (git+https://github.com/user/repo?rev=abc123#abc123def)"`
+
+### Path Remapping
+`remap_source_path(src_path, workspace_root, nix_src_var)` converts absolute paths to Nix expressions:
+```rust
+remap_source_path("/workspace/crates/foo/src/lib.rs", "/workspace", "src")
+// Returns: "${src}/crates/foo/src/lib.rs"
+```
+
+### Source Type Detection
+```rust
+loc.is_path()     // Local path source (workspace crates)
+loc.is_registry() // crates.io or other registry
+loc.is_git()      // Git dependency
+```
+
+### Nix Fileset Generation
+`loc.to_nix_fileset("src", include_cargo_toml)` generates minimal source expressions:
+```nix
+lib.fileset.toSource {
+  root = ${src};
+  fileset = lib.fileset.unions [
+    (${src}/src)
+    (${src}/Cargo.toml)
+  ];
+}
+```

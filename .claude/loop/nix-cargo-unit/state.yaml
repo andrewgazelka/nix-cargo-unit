@@ -26,7 +26,7 @@ features:
     relevant_files:
       - "@src/rustc_flags.rs"
       - "@src/lib.rs"
-    status: in_progress
+    status: done
     block_count: 0
 
   - id: 4
@@ -35,7 +35,7 @@ features:
     relevant_files:
       - "@src/source_filter.rs"
       - "@src/lib.rs"
-    status: pending
+    status: done
     block_count: 0
 
   # Phase 1b: Nix Generation
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 2
+  done: 4
   blocked: 0
   total: 17

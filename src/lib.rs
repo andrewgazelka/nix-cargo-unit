@@ -4,4 +4,5 @@
 //! Nix derivations for each compilation unit, enabling fine-grained caching.
 
 pub mod rustc_flags;
+pub mod source_filter;
 pub mod unit_graph;
