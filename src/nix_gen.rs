@@ -644,7 +644,13 @@ impl UnitDerivation {
         } else {
             // Libraries use --out-dir to produce output files
             script.push_str("  --out-dir build \\\n");
-            script.push_str("  --emit=dep-info,metadata,link \\\n");
+            // Proc-macros: emit only dep-info,link (metadata embedded in dylib)
+            // Regular libs: emit dep-info,metadata,link (rmeta needed for dependents)
+            if self.is_proc_macro {
+                script.push_str("  --emit=dep-info,link \\\n");
+            } else {
+                script.push_str("  --emit=dep-info,metadata,link \\\n");
+            }
         }
 
         // Add build script flags (expands to flags read from build script output)
@@ -1899,7 +1905,9 @@ mod tests {
 
         // Should use --out-dir for libraries (including proc-macros)
         assert!(build_phase.contains("--out-dir build"));
-        assert!(build_phase.contains("--emit=dep-info,metadata,link"));
+        // Proc-macros use dep-info,link only (metadata embedded in dylib)
+        assert!(build_phase.contains("--emit=dep-info,link"));
+        assert!(!build_phase.contains("--emit=dep-info,metadata,link"));
         assert!(drv.is_proc_macro);
 
         // Check install phase copies all outputs to $out
