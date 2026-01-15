@@ -644,7 +644,7 @@ impl UnitDerivation {
         } else {
             // Libraries use --out-dir to produce output files
             script.push_str("  --out-dir build \\\n");
-            script.push_str("  --emit=dep-info,link \\\n");
+            script.push_str("  --emit=dep-info,metadata,link \\\n");
         }
 
         // Add build script flags (expands to flags read from build script output)
@@ -1899,7 +1899,7 @@ mod tests {
 
         // Should use --out-dir for libraries (including proc-macros)
         assert!(build_phase.contains("--out-dir build"));
-        assert!(build_phase.contains("--emit=dep-info,link"));
+        assert!(build_phase.contains("--emit=dep-info,metadata,link"));
         assert!(drv.is_proc_macro);
 
         // Check install phase copies all outputs to $out
