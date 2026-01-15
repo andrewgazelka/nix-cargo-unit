@@ -412,10 +412,6 @@ pub struct UnitDerivation {
     /// Tuple of (nix_var, lib_name) - e.g., ("units.\"foo-1.0.0-hash\"", "foo")
     pub lib_search_deps: Vec<(String, String)>,
 
-    /// Crate names that have conflicting versions in the transitive closure.
-    /// These should NOT get --extern flags; rustc will find them via -L search.
-    pub conflicting_crates: rustc_hash::FxHashSet<String>,
-
     /// Build script outputs this unit depends on (if any).
     pub build_script_ref: Option<BuildScriptRef>,
 
@@ -486,7 +482,6 @@ impl UnitDerivation {
             is_proc_macro: unit.is_proc_macro(),
             deps: Vec::new(),
             lib_search_deps: Vec::new(),
-            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: None,
             rustc_flags,
             content_addressed,
@@ -507,11 +502,6 @@ impl UnitDerivation {
     /// Sets the library search dependencies (transitive deps for -L flags).
     pub fn set_lib_search_deps(&mut self, deps: Vec<(String, String)>) {
         self.lib_search_deps = deps;
-    }
-
-    /// Sets the conflicting crate names that should NOT get --extern flags.
-    pub fn set_conflicting_crates(&mut self, crates: rustc_hash::FxHashSet<String>) {
-        self.conflicting_crates = crates;
     }
 
     /// Generates the Nix derivation expression.
@@ -784,6 +774,11 @@ pub struct NixGenConfig {
 
     /// The host platform triple (for proc-macros and build scripts).
     pub host_platform: Option<String>,
+
+    /// Toolchain hash to include in identity computation.
+    /// This ensures derivation names change when the Rust toolchain changes,
+    /// preventing stale CA output reuse across nightly versions.
+    pub toolchain_hash: Option<String>,
 }
 
 impl NixGenConfig {
@@ -849,12 +844,14 @@ impl NixGenerator {
         // all dependents' hashes also change, matching how rustc embeds SVH into rlib metadata.
         let identity_hashes: Vec<String> = {
             let mut hashes: Vec<Option<String>> = vec![None; graph.units.len()];
+            let toolchain_hash = self.config.toolchain_hash.as_deref();
 
             // Compute in topological order using DFS
             fn compute_hash(
                 idx: usize,
                 graph: &UnitGraph,
                 hashes: &mut [Option<String>],
+                toolchain_hash: Option<&str>,
             ) -> String {
                 if let Some(ref h) = hashes[idx] {
                     return h.clone();
@@ -871,7 +868,7 @@ impl NixGenerator {
                             if dep_unit.mode == "run-custom-build" {
                                 None
                             } else {
-                                Some(compute_hash(dep.index, graph, hashes))
+                                Some(compute_hash(dep.index, graph, hashes, toolchain_hash))
                             }
                         })
                     })
@@ -879,14 +876,30 @@ impl NixGenerator {
 
                 // Now compute this unit's hash with dependency hashes included
                 let dep_refs: Vec<&str> = dep_hashes.iter().map(String::as_str).collect();
-                let hash = unit.identity_hash_with_deps(&dep_refs);
+                let mut hash = unit.identity_hash_with_deps(&dep_refs);
+
+                // Include toolchain hash to prevent stale CA outputs when rustc changes
+                // This ensures derivation names change when the Nix toolchain store path changes
+                if let Some(th) = toolchain_hash {
+                    use sha2::Digest as _;
+                    let mut hasher = sha2::Sha256::new();
+                    hasher.update(hash.as_bytes());
+                    hasher.update(b"\0");
+                    hasher.update(th.as_bytes());
+                    let combined = hasher.finalize();
+                    hash = format!(
+                        "{:016x}",
+                        u64::from_be_bytes(combined[..8].try_into().unwrap())
+                    );
+                }
+
                 hashes[idx] = Some(hash.clone());
                 hash
             }
 
             // Compute hashes for all units
             for i in 0..graph.units.len() {
-                compute_hash(i, graph, &mut hashes);
+                compute_hash(i, graph, &mut hashes, toolchain_hash);
             }
 
             hashes.into_iter().map(|h| h.unwrap()).collect()
@@ -1153,33 +1166,11 @@ impl NixGenerator {
                 .collect();
             drv.set_lib_search_deps(lib_deps);
 
-            // Detect conflicting crates: same lib_name but different identity hashes
-            // in the transitive closure. These should NOT get --extern flags because
-            // different deps may need different versions (e.g., due to feature divergence).
-            let mut lib_name_to_hashes: rustc_hash::FxHashMap<String, Vec<String>> =
-                rustc_hash::FxHashMap::default();
-            for &idx in transitive_deps[i].iter() {
-                if let Some(dep_unit) = graph.units.get(idx) {
-                    let lib_name = dep_unit.target.name.replace('-', "_");
-                    lib_name_to_hashes
-                        .entry(lib_name)
-                        .or_default()
-                        .push(identity_hashes[idx].clone());
-                }
-            }
-            let conflicting: rustc_hash::FxHashSet<String> = lib_name_to_hashes
-                .into_iter()
-                .filter_map(|(lib_name, hashes)| {
-                    // Conflicting if there are multiple UNIQUE hashes
-                    let unique: rustc_hash::FxHashSet<_> = hashes.into_iter().collect();
-                    if unique.len() > 1 {
-                        Some(lib_name)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            drv.set_conflicting_crates(conflicting);
+            // NOTE: Conflicting crate detection was removed. Cargo always emits --extern for
+            // direct dependencies, and "conflicts" only occur in transitive deps (which are
+            // resolved via -L search paths and SVH matching). The previous logic tried to skip
+            // --extern for conflicting crates, but this was incorrect - direct deps always need
+            // --extern. See commit 2ddfc10 "fix: always emit --extern for direct deps".
 
             let drv_name = &drv.name;
 
@@ -1584,7 +1575,6 @@ mod tests {
             is_proc_macro: false,
             deps: vec![],
             lib_search_deps: vec![],
-            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: None,
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
@@ -1884,7 +1874,6 @@ mod tests {
             is_proc_macro: false,
             deps: vec![],
             lib_search_deps: vec![],
-            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: Some(BuildScriptRef {
                 run_drv_var: "units.\"my-build-script-run\"".to_string(),
                 compile_drv_name: "my-build-script".to_string(),
@@ -1985,6 +1974,7 @@ mod tests {
             cross_compiling: true,
             host_platform: Some("aarch64-apple-darwin".to_string()),
             target_platform: Some("x86_64-unknown-linux-gnu".to_string()),
+            ..Default::default()
         };
         let nix_cross = NixGenerator::new(config_cross).generate(&graph);
 

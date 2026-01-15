@@ -42,4 +42,5 @@ When generating rustc invocations:
 Useful:
 - ~/Projects/rust
 - ~/Projects/cargo
-- ~/Projects/nix (custom nix with CA fixes; make your own fix if it is not right)
+- ~/Projects/nix (custom nix with CA fixes; make your own fix if it is not right; always someting to check)
+- ~/Projects/ix ... if we can get this to build with nix-cargo-unit; we know it works

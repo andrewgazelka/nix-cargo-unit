@@ -30,6 +30,10 @@ struct Cli {
     /// Target platform triple (for regular crates in cross-compilation)
     #[arg(long)]
     target_platform: Option<String>,
+
+    /// Toolchain hash to include in identity computation (prevents stale CA outputs when rustc changes)
+    #[arg(long)]
+    toolchain_hash: Option<String>,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -48,6 +52,7 @@ fn main() -> color_eyre::Result<()> {
             let mut config = NixGenConfig {
                 workspace_root: cli.workspace_root,
                 content_addressed: cli.content_addressed,
+                toolchain_hash: cli.toolchain_hash,
                 ..Default::default()
             };
 

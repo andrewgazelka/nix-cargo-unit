@@ -284,8 +284,16 @@ let
       crossCompile ? false,
       hostPlatform ? null,
       targetPlatform ? null,
+      # Toolchain store path - used to compute a hash that changes when rustc changes
+      # This prevents stale CA outputs from being reused across nightly versions
+      toolchainPath ? null,
     }:
     let
+      # Extract a short hash from the toolchain store path for identity computation
+      # The store path already encodes the exact toolchain version
+      toolchainHash = if toolchainPath != null
+        then builtins.substring 11 16 (baseNameOf toolchainPath)
+        else null;
       flags = lib.concatStringsSep " " (
         [
           "-w ${workspaceRoot}"
@@ -294,6 +302,7 @@ let
         ++ lib.optional crossCompile "--cross-compile"
         ++ lib.optional (hostPlatform != null) "--host-platform ${hostPlatform}"
         ++ lib.optional (targetPlatform != null) "--target-platform ${targetPlatform}"
+        ++ lib.optional (toolchainHash != null) "--toolchain-hash ${toolchainHash}"
       );
     in
     pkgs.runCommand "units.nix"
@@ -443,6 +452,8 @@ let
           hostPlatform
           targetPlatform
           ;
+        # Pass toolchain store path so identity hashes change when rustc changes
+        toolchainPath = rustToolchain;
       };
 
       # Step 3: Import the generated Nix (IFD - Import From Derivation)
