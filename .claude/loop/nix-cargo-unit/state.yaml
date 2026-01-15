@@ -112,7 +112,7 @@ features:
     relevant_files:
       - "@nix/lib.nix"
       - "@flake.nix"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 13

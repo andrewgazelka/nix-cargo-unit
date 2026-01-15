@@ -44,5 +44,23 @@
     overlays.default = final: prev: {
       nix-cargo-unit = self.packages.${final.system}.default;
     };
+
+    # Nix library for IFD-based per-unit builds
+    # Usage: nix-cargo-unit.lib { inherit pkgs; }
+    lib = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system}.extend self.overlays.default;
+    in
+      import ./nix/lib.nix {
+        inherit pkgs;
+        nix-cargo-unit = self.packages.${system}.default;
+      });
+
+    # Convenience function to create the library for any pkgs
+    # Usage: nix-cargo-unit.mkLib pkgs
+    mkLib = pkgs:
+      import ./nix/lib.nix {
+        inherit pkgs;
+        nix-cargo-unit = self.packages.${pkgs.system}.default;
+      };
   };
 }
