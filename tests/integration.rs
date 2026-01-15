@@ -12,18 +12,31 @@ const EXAMPLE_WORKSPACE: &str = "examples/workspace";
 
 /// Helper to run cargo --unit-graph on the example workspace.
 fn get_unit_graph() -> String {
-    let output = Command::new("cargo")
-        .args([
-            "+nightly",
-            "build",
-            "--unit-graph",
-            "-Z",
-            "unstable-options",
-            "--release",
-        ])
-        .current_dir(EXAMPLE_WORKSPACE)
-        .output()
-        .expect("failed to run cargo --unit-graph");
+    // In Nix, the toolchain is provided directly (no rustup), so we can't use +nightly
+    // Detect by checking if `cargo +nightly` works, fall back to plain cargo
+    let mut cmd = Command::new("cargo");
+
+    // Try +nightly first (rustup environment)
+    let nightly_check = Command::new("cargo")
+        .args(["+nightly", "--version"])
+        .output();
+
+    let use_nightly_flag = nightly_check.map(|o| o.status.success()).unwrap_or(false);
+
+    if use_nightly_flag {
+        cmd.arg("+nightly");
+    }
+
+    cmd.args([
+        "build",
+        "--unit-graph",
+        "-Z",
+        "unstable-options",
+        "--release",
+    ]);
+    cmd.current_dir(EXAMPLE_WORKSPACE);
+
+    let output = cmd.output().expect("failed to run cargo --unit-graph");
 
     if !output.status.success() {
         panic!(
@@ -111,7 +124,7 @@ fn test_nix_generation_produces_valid_structure() {
 
     // Check Nix structure
     assert!(
-        nix.contains("{ pkgs, rustToolchain, src }:"),
+        nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"),
         "missing function signature"
     );
     assert!(nix.contains("let"), "missing let block");
@@ -256,10 +269,12 @@ fn test_proc_macro_output_is_shared_library() {
     let generator = nix_cargo_unit::nix_gen::NixGenerator::new(config);
     let nix = generator.generate(&graph);
 
-    // Proc-macros should output to .so (shared library)
+    // Proc-macros should use --crate-type proc-macro which produces a shared library
+    // The extern references use find to locate the .so file
     assert!(
-        nix.contains("libexample_macros.so"),
-        "proc-macro should output to .so file"
+        nix.contains("--crate-type proc-macro")
+            || nix.contains("find") && nix.contains("libexample_macros"),
+        "proc-macro should use proc-macro crate type"
     );
 }
 
@@ -280,10 +295,10 @@ fn test_binary_output_is_in_bin_dir() {
     let generator = nix_cargo_unit::nix_gen::NixGenerator::new(config);
     let nix = generator.generate(&graph);
 
-    // Binaries should output to $out/bin/
+    // Binaries should output to $out/bin/ in installPhase
     assert!(
-        nix.contains("$out/bin/example-app"),
-        "binary should output to $out/bin/"
+        nix.contains("cp build/example-app $out/bin/"),
+        "binary should be copied to $out/bin/ in installPhase"
     );
 }
 

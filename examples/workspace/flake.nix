@@ -44,18 +44,10 @@
       default = workspace.default;
 
       # Access individual workspace members
-      example-app = workspace.packages.example-app or workspace.binaries.example-app or workspace.default;
-      example-core = workspace.packages.example-core or workspace.libraries.example-core or null;
-      example-macros = workspace.packages.example-macros or workspace.libraries.example-macros or null;
-
-      # All binaries for deployment
-      inherit (workspace) binaries;
-
-      # All libraries
-      inherit (workspace) libraries;
-
-      # Full workspace result for inspection
-      workspace-result = workspace;
+      # Note: library/proc-macro names use underscores (Rust convention), binary names can use hyphens
+      example-app = workspace.packages."example-app" or workspace.binaries."example-app" or workspace.default;
+      example-core = workspace.packages.example_core or workspace.libraries.example_core or null;
+      example-macros = workspace.packages.example_macros or workspace.libraries.example_macros or null;
 
       # Debug: expose intermediate outputs
       unit-graph-json = workspace.unitGraphJson;

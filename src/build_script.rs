@@ -15,7 +15,7 @@
 //! The run derivation outputs structured files that [`BuildScriptOutput`] can parse
 //! to generate the appropriate rustc flags.
 
-use crate::nix_gen::{NixAttrSet, escape_nix_multiline};
+use crate::nix_gen::NixAttrSet;
 use crate::rustc_flags::RustcFlags;
 use crate::unit_graph::Unit;
 
@@ -336,8 +336,12 @@ impl BuildScriptInfo {
         }
 
         let build_phase = self.generate_compile_phase();
-        attrs.multiline("buildPhase", &build_phase);
-        attrs.multiline("installPhase", "mkdir -p $out");
+        // Use multiline_interpolated so ${src} gets interpolated
+        attrs.multiline_interpolated("buildPhase", &build_phase);
+        attrs.multiline(
+            "installPhase",
+            "mkdir -p $out/bin\ncp build/build-script $out/bin/",
+        );
 
         attrs.render(2)
     }
@@ -346,8 +350,45 @@ impl BuildScriptInfo {
     fn generate_compile_phase(&self) -> String {
         let mut script = String::new();
 
-        script.push_str("mkdir -p $out/bin\n");
-        script.push_str("rustc \\\n");
+        // Build to temp directory first, then copy to $out in installPhase
+        script.push_str("mkdir -p build\n\n");
+
+        // Set Cargo environment variables that build scripts may use via env!() at compile time
+        script.push_str("# Cargo environment variables for env!() macros\n");
+        script.push_str(&format!(
+            "export CARGO_PKG_NAME=\"{}\"\n",
+            self.package_name
+        ));
+        script.push_str(&format!("export CARGO_PKG_VERSION=\"{}\"\n", self.version));
+
+        // Parse version components
+        let version_parts: Vec<&str> = self.version.split('.').collect();
+        let major = version_parts.first().unwrap_or(&"0");
+        let minor = version_parts.get(1).unwrap_or(&"0");
+        let patch_full = version_parts.get(2).unwrap_or(&"0");
+        // Strip any pre-release suffix from patch (e.g., "0-alpha" -> "0")
+        let patch = patch_full.split('-').next().unwrap_or("0");
+
+        script.push_str(&format!("export CARGO_PKG_VERSION_MAJOR=\"{}\"\n", major));
+        script.push_str(&format!("export CARGO_PKG_VERSION_MINOR=\"{}\"\n", minor));
+        script.push_str(&format!("export CARGO_PKG_VERSION_PATCH=\"{}\"\n", patch));
+        script.push_str("export CARGO_PKG_VERSION_PRE=\"\"\n");
+        script.push_str("export CARGO_PKG_AUTHORS=\"\"\n");
+        script.push_str("export CARGO_PKG_DESCRIPTION=\"\"\n");
+        script.push_str("export CARGO_PKG_HOMEPAGE=\"\"\n");
+        script.push_str("export CARGO_PKG_REPOSITORY=\"\"\n");
+        script.push_str("export CARGO_PKG_LICENSE=\"\"\n");
+        script.push_str("export CARGO_PKG_LICENSE_FILE=\"\"\n");
+        script.push_str("export CARGO_PKG_RUST_VERSION=\"\"\n");
+        script.push_str("export CARGO_PKG_README=\"\"\n");
+
+        // Set feature flags as environment variables
+        for feature in &self.features {
+            let env_name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+            script.push_str(&format!("export {env_name}=1\n"));
+        }
+
+        script.push_str("\nrustc \\\n");
 
         for arg in self.rustc_flags.args() {
             script.push_str("  ");
@@ -365,8 +406,8 @@ impl BuildScriptInfo {
         script.push_str(&self.src_path);
         script.push_str(" \\\n");
 
-        // Build script outputs to bin/build-script
-        script.push_str("  -o $out/bin/build-script");
+        // Build script outputs to build/build-script (will be copied to $out in installPhase)
+        script.push_str("  -o build/build-script");
 
         script
     }
@@ -399,8 +440,11 @@ impl BuildScriptInfo {
             attrs.string("outputHashAlgo", "sha256");
         }
 
-        let build_phase = self.generate_run_phase(compile_drv_var);
-        attrs.multiline("buildPhase", &build_phase);
+        // Wrap compile_drv_var in ${...} for shell interpolation
+        let shell_compile_var = format!("${{{}}}", compile_drv_var);
+        let build_phase = self.generate_run_phase(&shell_compile_var);
+        // Use multiline_interpolated so ${...} gets interpolated
+        attrs.multiline_interpolated("buildPhase", &build_phase);
         attrs.multiline("installPhase", "mkdir -p $out");
 
         attrs.render(2)
@@ -443,6 +487,8 @@ impl BuildScriptInfo {
         ));
 
         // Parse cargo: directives
+        // Use ''${...} for bash parameter expansion to prevent Nix interpolation
+        // ${...} without '' would be interpreted as Nix interpolation
         let parse_script = r#"  case "$line" in
     cargo:rustc-cfg=*)
       echo "''${line#cargo:rustc-cfg=}" >> $out/rustc-cfg
@@ -474,7 +520,7 @@ done
 # Create empty files if they don't exist (for consistent interface)
 touch $out/rustc-cfg $out/rustc-link-lib $out/rustc-link-search $out/rustc-env
 "#;
-        script.push_str(&escape_nix_multiline(parse_script));
+        script.push_str(parse_script);
 
         script
     }
@@ -608,7 +654,10 @@ mod tests {
         assert!(nix.contains("pname = \"my-crate-build-script\""));
         assert!(nix.contains("version = \"0.1.0\""));
         assert!(nix.contains("rustc"));
-        assert!(nix.contains("$out/bin/build-script"));
+        // Build phase outputs to build directory
+        assert!(nix.contains("-o build/build-script"));
+        // Install phase copies to $out
+        assert!(nix.contains("cp build/build-script $out/bin/"));
     }
 
     #[test]

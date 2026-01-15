@@ -416,8 +416,20 @@ impl Unit {
     }
 
     /// Extracts the package name from pkg_id.
-    /// Format: "name version (source)" -> "name"
+    /// Format (new): "path+file:///...#name@version" -> "name"
+    /// Format (old): "name version (source)" -> "name"
     pub fn package_name(&self) -> &str {
+        // Handle new Cargo format: "path+file:///...#name@version" or "registry+...#name@version"
+        if let Some(hash_pos) = self.pkg_id.find('#') {
+            let after_hash = &self.pkg_id[hash_pos + 1..];
+            // Split on @ to separate name from version
+            if let Some(at_pos) = after_hash.find('@') {
+                return &after_hash[..at_pos];
+            }
+            return after_hash;
+        }
+
+        // Fallback to old format: "name version (source)"
         self.pkg_id
             .split_whitespace()
             .next()
@@ -425,8 +437,20 @@ impl Unit {
     }
 
     /// Extracts the package version from pkg_id.
-    /// Format: "name version (source)" -> "version"
+    /// Format (new): "path+file:///...#name@version" -> "version"
+    /// Format (old): "name version (source)" -> "version"
     pub fn package_version(&self) -> Option<&str> {
+        // Handle new Cargo format: "path+file:///...#name@version"
+        if let Some(hash_pos) = self.pkg_id.find('#') {
+            let after_hash = &self.pkg_id[hash_pos + 1..];
+            if let Some(at_pos) = after_hash.find('@') {
+                return Some(&after_hash[at_pos + 1..]);
+            }
+            // No version in the new format
+            return None;
+        }
+
+        // Fallback to old format: "name version (source)"
         let mut parts = self.pkg_id.split_whitespace();
         parts.next(); // skip name
         parts.next() // return version

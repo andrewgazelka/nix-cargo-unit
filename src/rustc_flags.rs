@@ -33,9 +33,9 @@ impl RustcFlags {
     pub fn from_unit(unit: &Unit) -> Self {
         let mut flags = Self::new();
 
-        // Crate name (may differ from package name due to hyphen normalization)
+        // Crate name - normalize hyphens to underscores as required by rustc
         flags.push_arg("--crate-name");
-        flags.push_arg(&unit.target.name);
+        flags.push_arg(&unit.target.name.replace('-', "_"));
 
         // Edition
         flags.add_edition(&unit.target);

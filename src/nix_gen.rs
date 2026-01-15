@@ -132,11 +132,24 @@ impl NixAttrSet {
     }
 
     /// Adds a multiline string (using ''...'').
+    /// This escapes ${} to prevent accidental Nix interpolation.
     pub fn multiline(&mut self, key: &str, value: &str) -> &mut Self {
         self.attrs.push((
             key.to_string(),
             format!("''\n{}\n''", escape_nix_multiline(value)),
         ));
+        self
+    }
+
+    /// Adds a raw multiline string - no escaping is done.
+    /// Caller is responsible for proper Nix syntax:
+    /// - Use ${...} for Nix interpolation
+    /// - Use ''${...} for literal ${...} (bash variable expansion)
+    /// - Use ''' for literal ''
+    pub fn multiline_interpolated(&mut self, key: &str, value: &str) -> &mut Self {
+        // No escaping - caller handles Nix syntax
+        self.attrs
+            .push((key.to_string(), format!("''\n{}\n''", value)));
         self
     }
 
@@ -333,6 +346,9 @@ impl UnitDerivation {
         // Use hostRustToolchain for proc-macros when cross-compiling
         attrs.expr("nativeBuildInputs", &format!("[ {} ]", self.toolchain_var));
 
+        // Don't strip Rust libraries - it removes metadata required for compilation
+        attrs.bool("dontStrip", true);
+
         // Content-addressed derivation attributes
         if self.content_addressed {
             attrs.bool("__contentAddressed", true);
@@ -341,11 +357,13 @@ impl UnitDerivation {
         }
 
         // Build phase with rustc invocation
+        // Use multiline_interpolated so ${...} gets interpolated by Nix
         let build_phase = self.generate_build_phase();
-        attrs.multiline("buildPhase", &build_phase);
+        attrs.multiline_interpolated("buildPhase", &build_phase);
 
-        // Install phase
-        attrs.multiline("installPhase", "mkdir -p $out");
+        // Install phase - copy outputs from build directory to $out
+        let install_phase = self.generate_install_phase();
+        attrs.multiline("installPhase", &install_phase);
 
         attrs.render(2)
     }
@@ -354,12 +372,9 @@ impl UnitDerivation {
     fn generate_build_phase(&self) -> String {
         let mut script = String::new();
 
-        // Create output directories
-        if self.crate_types.contains(&"bin".to_string()) {
-            script.push_str("mkdir -p $out/bin\n");
-        } else {
-            script.push_str("mkdir -p $out/lib\n");
-        }
+        // Create build directory (NOT $out - $out is read-only during buildPhase in Nix sandbox)
+        // We'll copy outputs to $out in installPhase
+        script.push_str("mkdir -p build\n");
 
         // Initialize build script flags variable
         script.push_str("BUILD_SCRIPT_FLAGS=\"\"\n");
@@ -367,9 +382,9 @@ impl UnitDerivation {
         // Read build script outputs if this unit depends on a build script
         if let Some(ref bs_ref) = self.build_script_ref {
             script.push_str("\n");
-            script.push_str(&BuildScriptOutput::generate_nix_flag_reader(
-                &bs_ref.run_drv_var,
-            ));
+            // Wrap in ${...} for Nix interpolation in multiline strings
+            let shell_var = format!("${{{}}}", bs_ref.run_drv_var);
+            script.push_str(&BuildScriptOutput::generate_nix_flag_reader(&shell_var));
             script.push_str("\n");
         }
 
@@ -391,9 +406,10 @@ impl UnitDerivation {
 
         // Add -L library search paths for all dependencies
         // This allows rustc to find transitive .rlib files
+        // Wrap nix_var in ${...} for Nix interpolation in multiline strings
         for dep in &self.deps {
             script.push_str("  -L ");
-            script.push_str(&format!("dependency={}/lib", dep.nix_var));
+            script.push_str(&format!("dependency=${{{}}}/lib", dep.nix_var));
             script.push_str(" \\\n");
         }
 
@@ -401,19 +417,21 @@ impl UnitDerivation {
         for dep in &self.deps {
             script.push_str("  --extern ");
             // Determine the library file name based on whether it's a proc-macro
+            // Wrap nix_var in ${...} for Nix interpolation
             let lib_file = if dep.is_proc_macro {
                 // Proc-macros are shared libraries (.so on Linux, .dylib on macOS)
-                // Use a glob pattern since extension varies by platform
+                // Look specifically for dylib/so files, not .rmeta or .d files
                 format!(
-                    "{}=\"$(find {}/lib -name 'lib{}.*' -type f | head -1)\"",
+                    "{}=\"$(find ${{{}}}/lib -type f \\( -name 'lib{}.so' -o -name 'lib{}.dylib' \\) | head -1)\"",
                     dep.extern_crate_name,
                     dep.nix_var,
+                    dep.extern_crate_name.replace('-', "_"),
                     dep.extern_crate_name.replace('-', "_")
                 )
             } else {
                 // Regular dependencies use .rlib
                 format!(
-                    "{}={}/lib/lib{}.rlib",
+                    "{}=${{{}}}/lib/lib{}.rlib",
                     dep.extern_crate_name,
                     dep.nix_var,
                     dep.extern_crate_name.replace('-', "_")
@@ -428,21 +446,39 @@ impl UnitDerivation {
         script.push_str(&self.src_path);
         script.push_str(" \\\n");
 
-        // Add output
-        let output_name = if self.crate_types.contains(&"bin".to_string()) {
-            format!("$out/bin/{}", self.pname)
-        } else if self.crate_types.contains(&"proc-macro".to_string()) {
-            // Proc-macros are shared libraries
-            format!("$out/lib/lib{}.so", self.pname.replace('-', "_"))
+        // Add output options
+        if self.crate_types.contains(&"bin".to_string()) {
+            // Binaries use -o for direct output
+            script.push_str("  -o build/");
+            script.push_str(&self.pname);
+            script.push_str(" \\\n");
         } else {
-            format!("$out/lib/lib{}.rlib", self.pname.replace('-', "_"))
-        };
-        script.push_str("  -o ");
-        script.push_str(&output_name);
-        script.push_str(" \\\n");
+            // Libraries use --out-dir to produce output files
+            // Use --emit=link only (not metadata) so metadata is embedded in .rlib
+            // This matches cargo's default behavior
+            script.push_str("  --out-dir build \\\n");
+            script.push_str("  --emit=dep-info,link \\\n");
+        }
 
         // Add build script flags (expands to flags read from build script output)
         script.push_str("  $BUILD_SCRIPT_FLAGS");
+
+        script
+    }
+
+    /// Generates the install phase script.
+    fn generate_install_phase(&self) -> String {
+        let mut script = String::new();
+
+        if self.crate_types.contains(&"bin".to_string()) {
+            script.push_str("mkdir -p $out/bin\n");
+            script.push_str(&format!("cp build/{} $out/bin/", self.pname));
+        } else {
+            // For libraries and proc-macros, copy all outputs from --out-dir
+            // This includes .rlib, .rmeta, .d files
+            script.push_str("mkdir -p $out/lib\n");
+            script.push_str("cp build/* $out/lib/");
+        }
 
         script
     }
@@ -522,12 +558,8 @@ impl NixGenerator {
         out.push_str("# Do not edit manually\n\n");
 
         // Function signature
-        // Include hostRustToolchain parameter for cross-compilation support
-        if self.config.cross_compiling {
-            out.push_str("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:\n\n");
-        } else {
-            out.push_str("{ pkgs, rustToolchain, src }:\n\n");
-        }
+        // Always include hostRustToolchain with default for compatibility with lib.nix
+        out.push_str("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:\n\n");
 
         // Let block
         out.push_str("let\n");
@@ -846,7 +878,7 @@ mod tests {
         let nix = generator.generate(&graph);
 
         // Check structure
-        assert!(nix.contains("{ pkgs, rustToolchain, src }:"));
+        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"));
         assert!(nix.contains("mkUnit = attrs:"));
         assert!(nix.contains("units = {"));
         assert!(nix.contains("roots = ["));
@@ -912,8 +944,8 @@ mod tests {
         assert!(nix.contains("pname = \"dep\""));
         assert!(nix.contains("pname = \"app\""));
 
-        // Should have bin output path
-        assert!(nix.contains("$out/bin/app"));
+        // Should have bin output in installPhase
+        assert!(nix.contains("cp build/app $out/bin/"));
 
         // Should have --extern flag for dependency
         assert!(nix.contains("--extern"));
@@ -1333,9 +1365,12 @@ mod tests {
         };
         let nix = NixGenerator::new(config).generate(&graph);
 
-        // Should use rustToolchain for both
-        assert!(nix.contains("{ pkgs, rustToolchain, src }:"));
-        assert!(!nix.contains("hostRustToolchain"));
+        // Should use rustToolchain for both (hostRustToolchain is in signature but defaults to rustToolchain)
+        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"));
+        // Proc-macro should use rustToolchain when not cross-compiling
+        assert!(nix.contains("nativeBuildInputs = [ rustToolchain ]"));
+        // Should NOT have hostRustToolchain in nativeBuildInputs when not cross-compiling
+        assert!(!nix.contains("nativeBuildInputs = [ hostRustToolchain ]"));
 
         // With cross-compilation: proc-macro uses hostRustToolchain
         let config_cross = NixGenConfig {
@@ -1391,9 +1426,15 @@ mod tests {
         let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
         let build_phase = drv.generate_build_phase();
 
-        // Should output to shared library path (.so)
-        assert!(build_phase.contains("$out/lib/libmy_macro.so"));
+        // Should use --out-dir for libraries (including proc-macros)
+        assert!(build_phase.contains("--out-dir build"));
+        assert!(build_phase.contains("--emit=dep-info,link"));
         assert!(drv.is_proc_macro);
+
+        // Check install phase copies all outputs to $out
+        let install_phase = drv.generate_install_phase();
+        assert!(install_phase.contains("$out/lib"));
+        assert!(install_phase.contains("cp build/*"));
     }
 
     #[test]
