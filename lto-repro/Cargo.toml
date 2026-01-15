@@ -1,0 +1,12 @@
+[package]
+name = "lto-repro"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+
+[profile.release]
+lto = "fat"

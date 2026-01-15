@@ -1522,15 +1522,16 @@ mod tests {
 
     #[test]
     fn test_multiline_build_phase() {
+        // Use bin crate type so LTO is applied (LTO only works for bin/cdylib/staticlib)
         let json = r#"{
             "version": 1,
             "units": [{
                 "pkg_id": "test 0.1.0 (path+file:///workspace)",
                 "target": {
-                    "kind": ["lib"],
-                    "crate_types": ["lib"],
+                    "kind": ["bin"],
+                    "crate_types": ["bin"],
                     "name": "test",
-                    "src_path": "/workspace/src/lib.rs",
+                    "src_path": "/workspace/src/main.rs",
                     "edition": "2021"
                 },
                 "profile": {"name": "release", "opt_level": "3", "lto": "thin"},

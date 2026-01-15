@@ -96,9 +96,15 @@ impl RustcFlags {
         // Debug info
         self.add_debuginfo(profile.debuginfo);
 
-        // LTO - skip for proc-macros (rustc errors: "lto cannot be used for proc-macro crate type")
-        let is_proc_macro = target.crate_types.iter().any(|t| t == "proc-macro");
-        if !is_proc_macro {
+        // LTO - only valid for executables, cdylibs, and staticlibs
+        // rustc errors: "lto can only be run for executables, cdylibs and static library outputs"
+        // If ANY crate type is not in the allowed set, skip LTO entirely
+        let lto_allowed_types = ["bin", "cdylib", "staticlib"];
+        let can_use_lto = target
+            .crate_types
+            .iter()
+            .all(|t| lto_allowed_types.contains(&t.as_str()));
+        if can_use_lto {
             self.add_lto(&profile.lto);
         }
 
@@ -356,15 +362,16 @@ mod tests {
 
     #[test]
     fn test_release_profile_flags() {
+        // Use bin crate type to test LTO (LTO only works for bin/cdylib/staticlib)
         let json = r#"{
             "version": 1,
             "units": [{
                 "pkg_id": "test 0.1.0 (path+file:///test)",
                 "target": {
-                    "kind": ["lib"],
-                    "crate_types": ["lib"],
+                    "kind": ["bin"],
+                    "crate_types": ["bin"],
                     "name": "test",
-                    "src_path": "/test/src/lib.rs",
+                    "src_path": "/test/src/main.rs",
                     "edition": "2021"
                 },
                 "profile": {
@@ -583,6 +590,85 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.contains("lto=")),
             "proc-macro should not have LTO flag, got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn test_rlib_mixed_crate_types_no_lto() {
+        // LTO cannot be used when lib (rlib) is one of the crate types
+        // rustc errors: "lto can only be run for executables, cdylibs and static library outputs"
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "crc-fast 1.6.0 (registry)",
+                "target": {
+                    "kind": ["lib", "cdylib", "staticlib"],
+                    "crate_types": ["lib", "cdylib", "staticlib"],
+                    "name": "crc_fast",
+                    "src_path": "/test/src/lib.rs",
+                    "edition": "2021"
+                },
+                "profile": {
+                    "name": "release",
+                    "opt_level": "3",
+                    "lto": "fat"
+                },
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_test_unit_graph(json);
+        let unit = &graph.units[0];
+        let flags = RustcFlags::from_unit(unit);
+        let args = flags.args();
+
+        // LTO should NOT be present when rlib is one of the crate types
+        assert!(
+            !args.iter().any(|a| a.contains("lto=")),
+            "mixed crate types including lib (rlib) should not have LTO flag, got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn test_cdylib_staticlib_only_has_lto() {
+        // LTO IS allowed when only cdylib and staticlib are the crate types
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "my-lib 0.1.0 (path)",
+                "target": {
+                    "kind": ["cdylib", "staticlib"],
+                    "crate_types": ["cdylib", "staticlib"],
+                    "name": "my_lib",
+                    "src_path": "/test/src/lib.rs",
+                    "edition": "2021"
+                },
+                "profile": {
+                    "name": "release",
+                    "opt_level": "3",
+                    "lto": "fat"
+                },
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_test_unit_graph(json);
+        let unit = &graph.units[0];
+        let flags = RustcFlags::from_unit(unit);
+        let args = flags.args();
+
+        // LTO SHOULD be present when only cdylib/staticlib (no rlib)
+        assert!(
+            args.iter().any(|a| a.contains("lto=fat")),
+            "cdylib+staticlib should have LTO flag, got: {:?}",
             args
         );
     }
