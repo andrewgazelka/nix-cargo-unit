@@ -177,6 +177,14 @@ impl NixAttrSet {
         self
     }
 
+    /// Adds content-addressed derivation attributes.
+    pub fn add_ca_attrs(&mut self) -> &mut Self {
+        self.bool("__contentAddressed", true);
+        self.string("outputHashMode", "recursive");
+        self.string("outputHashAlgo", "sha256");
+        self
+    }
+
     /// Adds an integer attribute.
     pub fn int(&mut self, key: &str, value: i64) -> &mut Self {
         self.attrs.push((key.to_string(), value.to_string()));
@@ -442,9 +450,7 @@ impl UnitDerivation {
 
         // Content-addressed derivation attributes
         if self.content_addressed {
-            attrs.bool("__contentAddressed", true);
-            attrs.string("outputHashMode", "recursive");
-            attrs.string("outputHashAlgo", "sha256");
+            attrs.add_ca_attrs();
         }
 
         // Build phase with rustc invocation
@@ -492,14 +498,7 @@ impl UnitDerivation {
         // Add each flag on its own line for readability
         for arg in self.rustc_flags.args() {
             script.push_str("  ");
-            // Escape for shell if needed
-            if arg.contains(' ') || arg.contains('"') || arg.contains('$') {
-                script.push('\'');
-                script.push_str(&arg.replace('\'', "'\\''"));
-                script.push('\'');
-            } else {
-                script.push_str(arg);
-            }
+            script.push_str(&crate::shell::quote_arg(arg));
             script.push_str(" \\\n");
         }
 
@@ -968,11 +967,7 @@ impl NixGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit_graph::UnitGraph;
-
-    fn parse_unit_graph(json: &str) -> UnitGraph {
-        serde_json::from_str(json).expect("failed to parse unit graph")
-    }
+    use crate::unit_graph::parse_test_unit_graph;
 
     #[test]
     fn test_escape_nix_string() {
@@ -1038,7 +1033,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
@@ -1072,7 +1067,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
@@ -1135,7 +1130,7 @@ mod tests {
             "roots": [1]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
@@ -1217,7 +1212,7 @@ mod tests {
             "roots": [2]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
@@ -1304,7 +1299,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
@@ -1343,7 +1338,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         // Without content-addressed
@@ -1382,7 +1377,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
 
         // Without CA
         let config = NixGenConfig {
@@ -1465,7 +1460,7 @@ mod tests {
             "roots": [2]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
@@ -1605,7 +1600,7 @@ mod tests {
             "roots": [1]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
 
         // Without cross-compilation: both use rustToolchain
         let config = NixGenConfig {
@@ -1671,7 +1666,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
@@ -1744,7 +1739,7 @@ mod tests {
             "roots": [0, 1, 2]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,

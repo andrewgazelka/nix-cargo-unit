@@ -410,11 +410,7 @@ fn remap_registry_path(src_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit_graph::UnitGraph;
-
-    fn parse_unit_graph(json: &str) -> UnitGraph {
-        serde_json::from_str(json).expect("failed to parse unit graph")
-    }
+    use crate::unit_graph::parse_test_unit_graph;
 
     #[test]
     fn test_parse_path_pkg_id() {
@@ -509,7 +505,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let loc = SourceLocation::from_unit(unit).unwrap();
 
@@ -541,7 +537,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let loc = SourceLocation::from_unit(unit).unwrap();
 
@@ -570,7 +566,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let loc = SourceLocation::from_unit(unit).unwrap();
 
@@ -618,7 +614,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let loc = SourceLocation::from_unit(unit).unwrap();
 
@@ -648,7 +644,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let loc = SourceLocation::from_unit(unit).unwrap();
 

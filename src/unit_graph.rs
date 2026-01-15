@@ -550,6 +550,12 @@ impl UnitGraph {
     }
 }
 
+/// Parses a unit graph from JSON. Test helper available to all crate tests.
+#[cfg(test)]
+pub(crate) fn parse_test_unit_graph(json: &str) -> UnitGraph {
+    serde_json::from_str(json).expect("failed to parse unit graph")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

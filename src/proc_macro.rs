@@ -216,11 +216,7 @@ impl ProcMacroConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit_graph::UnitGraph;
-
-    fn parse_unit_graph(json: &str) -> UnitGraph {
-        serde_json::from_str(json).expect("failed to parse unit graph")
-    }
+    use crate::unit_graph::parse_test_unit_graph;
 
     #[test]
     fn test_proc_macro_detection() {
@@ -246,7 +242,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         assert!(is_proc_macro_unit(unit));
@@ -286,7 +282,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         assert!(!is_proc_macro_unit(unit));
@@ -320,7 +316,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         // Not cross-compiling when target matches host
@@ -364,7 +360,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let info = ProcMacroInfo::from_unit(unit, None).unwrap();
 
@@ -395,7 +391,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let info = ProcMacroInfo::from_unit(unit, None).unwrap();
 
@@ -461,7 +457,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         // Build scripts also require host toolchain

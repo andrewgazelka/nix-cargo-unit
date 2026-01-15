@@ -94,22 +94,10 @@ impl RustcFlags {
         }
 
         // Debug assertions
-        if profile.debug_assertions {
-            self.push_arg("-C");
-            self.push_arg("debug-assertions=yes");
-        } else {
-            self.push_arg("-C");
-            self.push_arg("debug-assertions=no");
-        }
+        self.push_codegen_bool("debug-assertions", profile.debug_assertions);
 
         // Overflow checks
-        if profile.overflow_checks {
-            self.push_arg("-C");
-            self.push_arg("overflow-checks=yes");
-        } else {
-            self.push_arg("-C");
-            self.push_arg("overflow-checks=no");
-        }
+        self.push_codegen_bool("overflow-checks", profile.overflow_checks);
 
         // Panic strategy
         self.add_panic(&profile.panic);
@@ -247,6 +235,11 @@ impl RustcFlags {
         self.push_arg(&format!("{key}={value}"));
     }
 
+    /// Adds a codegen flag in the form `-C key=yes` or `-C key=no`.
+    fn push_codegen_bool(&mut self, key: &str, value: bool) {
+        self.push_codegen_flag(key, if value { "yes" } else { "no" });
+    }
+
     /// Returns the flags as a vector of strings.
     pub fn into_args(self) -> Vec<String> {
         self.args
@@ -263,13 +256,7 @@ impl RustcFlags {
     pub fn to_shell_string(&self) -> String {
         self.args
             .iter()
-            .map(|arg| {
-                if arg.contains(' ') || arg.contains('"') || arg.contains('$') {
-                    format!("'{}'", arg.replace('\'', "'\\''"))
-                } else {
-                    arg.clone()
-                }
-            })
+            .map(|arg| crate::shell::quote_arg(arg).into_owned())
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -284,11 +271,7 @@ impl std::fmt::Display for RustcFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit_graph::UnitGraph;
-
-    fn parse_unit_graph(json: &str) -> UnitGraph {
-        serde_json::from_str(json).expect("failed to parse unit graph")
-    }
+    use crate::unit_graph::parse_test_unit_graph;
 
     #[test]
     fn test_basic_lib_flags() {
@@ -314,7 +297,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let args = flags.args();
@@ -374,7 +357,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let args = flags.args();
@@ -410,7 +393,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let shell = flags.to_shell_string();
@@ -441,7 +424,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let args = flags.args();
@@ -494,7 +477,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let shell = flags.to_shell_string();
@@ -527,7 +510,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let flags = RustcFlags::from_unit(unit);
         let args = flags.args();

@@ -59,31 +59,28 @@ impl BuildScriptOutput {
         }
     }
 
-    /// Parses the `rustc-cfg` file contents.
-    pub fn parse_cfgs(contents: &str) -> Vec<String> {
+    /// Parses lines from a build script output file.
+    fn parse_lines(contents: &str) -> Vec<String> {
         contents
             .lines()
             .filter_map(Self::parse_line)
             .map(String::from)
             .collect()
+    }
+
+    /// Parses the `rustc-cfg` file contents.
+    pub fn parse_cfgs(contents: &str) -> Vec<String> {
+        Self::parse_lines(contents)
     }
 
     /// Parses the `rustc-link-lib` file contents.
     pub fn parse_link_libs(contents: &str) -> Vec<String> {
-        contents
-            .lines()
-            .filter_map(Self::parse_line)
-            .map(String::from)
-            .collect()
+        Self::parse_lines(contents)
     }
 
     /// Parses the `rustc-link-search` file contents.
     pub fn parse_link_searches(contents: &str) -> Vec<String> {
-        contents
-            .lines()
-            .filter_map(Self::parse_line)
-            .map(String::from)
-            .collect()
+        Self::parse_lines(contents)
     }
 
     /// Parses the `rustc-env` file contents.
@@ -102,11 +99,7 @@ impl BuildScriptOutput {
 
     /// Parses the `rustc-cdylib-link-arg` file contents.
     pub fn parse_cdylib_link_args(contents: &str) -> Vec<String> {
-        contents
-            .lines()
-            .filter_map(Self::parse_line)
-            .map(String::from)
-            .collect()
+        Self::parse_lines(contents)
     }
 
     /// Creates a BuildScriptOutput from the contents of all output files.
@@ -174,57 +167,45 @@ impl BuildScriptOutput {
 
     /// Generates Nix code to read build script outputs and construct rustc flags.
     ///
+    /// Generates shell snippet to read a build script output file and append flags.
+    fn flag_reader_snippet(var: &str, filename: &str, flag_format: &str) -> String {
+        format!(
+            r#"if [ -f {var}/{filename} ]; then
+  while IFS= read -r line; do
+    [ -n "$line" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS {flag_format}"
+  done < {var}/{filename}
+fi
+"#,
+            var = var,
+            filename = filename,
+            flag_format = flag_format
+        )
+    }
+
     /// This generates shell script code that reads from the build script output
     /// derivation and constructs the appropriate flags.
     ///
     /// `build_script_output_var` is the Nix variable referencing the run derivation
     /// (e.g., `"$buildScriptOutput"`).
     pub fn generate_nix_flag_reader(build_script_output_var: &str) -> String {
-        let mut script = String::new();
+        let var = build_script_output_var;
+        let mut script = String::from("# Read build script outputs\n");
 
-        // Read cfg flags
-        script.push_str(&format!(
-            r#"# Read build script outputs
-if [ -f {var}/rustc-cfg ]; then
-  while IFS= read -r cfg; do
-    [ -n "$cfg" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS --cfg $cfg"
-  done < {var}/rustc-cfg
-fi
-"#,
-            var = build_script_output_var
+        script.push_str(&Self::flag_reader_snippet(var, "rustc-cfg", "--cfg $line"));
+        script.push_str(&Self::flag_reader_snippet(
+            var,
+            "rustc-link-lib",
+            "-l $line",
         ));
-
-        // Read link libs
-        script.push_str(&format!(
-            r#"if [ -f {var}/rustc-link-lib ]; then
-  while IFS= read -r lib; do
-    [ -n "$lib" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS -l $lib"
-  done < {var}/rustc-link-lib
-fi
-"#,
-            var = build_script_output_var
+        script.push_str(&Self::flag_reader_snippet(
+            var,
+            "rustc-link-search",
+            "-L $line",
         ));
-
-        // Read link search paths
-        script.push_str(&format!(
-            r#"if [ -f {var}/rustc-link-search ]; then
-  while IFS= read -r search; do
-    [ -n "$search" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS -L $search"
-  done < {var}/rustc-link-search
-fi
-"#,
-            var = build_script_output_var
-        ));
-
-        // Read cdylib link args
-        script.push_str(&format!(
-            r#"if [ -f {var}/rustc-cdylib-link-arg ]; then
-  while IFS= read -r arg; do
-    [ -n "$arg" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS -C link-arg=$arg"
-  done < {var}/rustc-cdylib-link-arg
-fi
-"#,
-            var = build_script_output_var
+        script.push_str(&Self::flag_reader_snippet(
+            var,
+            "rustc-cdylib-link-arg",
+            "-C link-arg=$line",
         ));
 
         // Export OUT_DIR for generated files
@@ -232,7 +213,7 @@ fi
             r#"# Set OUT_DIR for generated code
 export OUT_DIR={var}/out-dir
 "#,
-            var = build_script_output_var
+            var = var
         ));
 
         script
@@ -348,9 +329,7 @@ impl BuildScriptInfo {
         );
 
         if self.content_addressed {
-            attrs.bool("__contentAddressed", true);
-            attrs.string("outputHashMode", "recursive");
-            attrs.string("outputHashAlgo", "sha256");
+            attrs.add_ca_attrs();
         }
 
         let build_phase = self.generate_compile_phase();
@@ -382,13 +361,7 @@ impl BuildScriptInfo {
 
         for arg in self.rustc_flags.args() {
             script.push_str("  ");
-            if arg.contains(' ') || arg.contains('"') || arg.contains('$') {
-                script.push('\'');
-                script.push_str(&arg.replace('\'', "'\\''"));
-                script.push('\'');
-            } else {
-                script.push_str(arg);
-            }
+            script.push_str(&crate::shell::quote_arg(arg));
             script.push_str(" \\\n");
         }
 
@@ -430,9 +403,7 @@ impl BuildScriptInfo {
         );
 
         if self.content_addressed {
-            attrs.bool("__contentAddressed", true);
-            attrs.string("outputHashMode", "recursive");
-            attrs.string("outputHashAlgo", "sha256");
+            attrs.add_ca_attrs();
         }
 
         // Wrap compile_drv_var in ${...} for shell interpolation
@@ -629,11 +600,7 @@ pub fn is_build_script_compile(unit: &Unit) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unit_graph::UnitGraph;
-
-    fn parse_unit_graph(json: &str) -> UnitGraph {
-        serde_json::from_str(json).expect("failed to parse unit graph")
-    }
+    use crate::unit_graph::parse_test_unit_graph;
 
     #[test]
     fn test_build_script_detection() {
@@ -658,7 +625,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         assert!(is_build_script_unit(unit));
@@ -699,7 +666,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
 
         assert!(!is_build_script_unit(unit));
@@ -730,7 +697,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let info = BuildScriptInfo::from_unit(unit, "/workspace", false).unwrap();
 
@@ -768,7 +735,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let info = BuildScriptInfo::from_unit(unit, "/workspace", false).unwrap();
 
@@ -805,7 +772,7 @@ mod tests {
             "roots": [0]
         }"#;
 
-        let graph = parse_unit_graph(json);
+        let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
         let info = BuildScriptInfo::from_unit(unit, "/workspace", true).unwrap();
 
