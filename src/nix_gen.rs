@@ -182,7 +182,9 @@ impl NixAttrSet {
         self.bool("__contentAddressed", true);
         self.string("outputHashMode", "recursive");
         self.string("outputHashAlgo", "sha256");
-        // Skip fixup phase - it runs chmod which fails on read-only CA store paths
+        // Skip fixup phase entirely for CA derivations:
+        // 1. Rust crates don't need stripping/patching that fixup provides
+        // 2. fixupPhase runs chmod which fails on read-only CA store paths
         self.bool("dontFixup", true);
         self
     }
@@ -592,15 +594,24 @@ impl UnitDerivation {
         if self.crate_types.contains(&"bin".to_string()) {
             // Skip entirely if binary exists (CA-derivation reuse)
             script.push_str(&format!(
-                "[ -f \"$out/bin/{}\" ] || {{ mkdir -p $out/bin && cp build/{} $out/bin/; }}",
-                self.pname, self.pname
+                r#"[ -f "$out/bin/{0}" ] || {{
+  mkdir -p $out/bin
+  cp build/{0} $out/bin/
+  chmod 755 $out/bin/{0}
+}}"#,
+                self.pname
             ));
         } else {
             // For libraries and proc-macros, copy all outputs from --out-dir
             // This includes .rlib, .rmeta, .d files
             // Skip entirely if $out/lib exists (CA-derivation reuse)
-            script
-                .push_str("[ -d \"$out/lib\" ] || { mkdir -p $out/lib && cp build/* $out/lib/; }");
+            script.push_str(
+                r#"[ -d "$out/lib" ] || {
+  mkdir -p $out/lib
+  cp build/* $out/lib/
+  chmod 644 $out/lib/*
+}"#,
+            );
         }
 
         script
@@ -751,12 +762,21 @@ impl NixGenerator {
         let mut build_script_refs: std::collections::HashMap<usize, BuildScriptRef> =
             std::collections::HashMap::new();
 
+        // First pass: identify all build script RUN units and their info
+        // We need this map to wire up DEP_* variables between build scripts
+        struct BuildScriptRunInfo {
+            unit_index: usize,
+            package_name: String,
+            compile_dep_index: usize,
+            info: BuildScriptInfo,
+        }
+        let mut build_script_runs: Vec<BuildScriptRunInfo> = Vec::new();
+        let mut package_to_bs_run: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
         for (i, unit) in graph.units.iter().enumerate() {
             if unit.mode == "run-custom-build" {
                 // This is a build script RUN unit - find its compile unit dependency
-                // The compile unit will be processed as a normal derivation in the main loop
-                // Find the COMPILE unit (mode="build", kind=["custom-build"]), not another
-                // run-custom-build unit which also has kind=["custom-build"]
                 let compile_dep = unit.dependencies.iter().find(|dep| {
                     graph.units.get(dep.index).is_some_and(|u| {
                         u.mode == "build" && u.target.kind.contains(&"custom-build".to_string())
@@ -764,35 +784,89 @@ impl NixGenerator {
                 });
 
                 if let Some(compile_dep) = compile_dep {
-                    let compile_drv_name = drv_names[compile_dep.index].clone();
-
-                    // Generate RUN derivation name
                     let info = BuildScriptInfo::from_unit(
                         unit,
                         &self.config.workspace_root,
                         self.config.content_addressed,
                     );
                     if let Some(info) = info {
-                        // Generate run derivation (depends on compile derivation)
-                        let compile_var = format!("units.\"{}\"", compile_drv_name);
-                        build_script_run_derivations.push(format!(
-                            "    \"{}\" = mkUnit {};\n",
-                            info.run_drv_name,
-                            info.run_derivation(&compile_var)
-                        ));
-
-                        // Store the reference for units that depend on this build script
-                        build_script_refs.insert(
-                            i,
-                            BuildScriptRef {
-                                run_drv_var: format!("units.\"{}\"", info.run_drv_name),
-                                compile_drv_name,
-                                run_drv_name: info.run_drv_name,
-                            },
-                        );
+                        let package_name = unit.package_name().to_string();
+                        package_to_bs_run.insert(package_name.clone(), build_script_runs.len());
+                        build_script_runs.push(BuildScriptRunInfo {
+                            unit_index: i,
+                            package_name,
+                            compile_dep_index: compile_dep.index,
+                            info,
+                        });
                     }
                 }
             }
+        }
+
+        // Second pass: for each build script RUN, find which other build scripts' outputs
+        // it should receive DEP_* variables from (based on library dependencies)
+        for bs_run in &build_script_runs {
+            let compile_drv_name = drv_names[bs_run.compile_dep_index].clone();
+            let compile_var = format!("units.\"{}\"", compile_drv_name);
+
+            // Find dependency build script outputs:
+            // Look at the library unit for this package and collect build script outputs
+            // from its dependencies
+            let mut dep_bs_outputs: Vec<String> = Vec::new();
+
+            // Find the library unit for this package (same pkg_id, mode="build", kind contains "lib")
+            let unit = &graph.units[bs_run.unit_index];
+            let lib_unit_idx = graph.units.iter().enumerate().find(|(_, u)| {
+                u.pkg_id == unit.pkg_id
+                    && u.mode == "build"
+                    && (u.target.kind.contains(&"lib".to_string())
+                        || u.target.kind.contains(&"rlib".to_string()))
+            });
+
+            if let Some((lib_idx, lib_unit)) = lib_unit_idx {
+                // For each dependency of the library unit, check if it has a build script
+                for dep in &lib_unit.dependencies {
+                    if let Some(dep_unit) = graph.units.get(dep.index) {
+                        // If this dependency is a build script RUN, add it
+                        if dep_unit.mode == "run-custom-build" {
+                            if let Some(other_bs_run_idx) =
+                                package_to_bs_run.get(dep_unit.package_name())
+                            {
+                                let other_bs = &build_script_runs[*other_bs_run_idx];
+                                dep_bs_outputs
+                                    .push(format!("units.\"{}\"", other_bs.info.run_drv_name));
+                            }
+                        }
+                        // Also check if the dependency's package has a build script
+                        // (in case it's a lib unit that depends on another lib)
+                        let dep_pkg_name = dep_unit.package_name();
+                        if let Some(other_bs_run_idx) = package_to_bs_run.get(dep_pkg_name) {
+                            let other_bs = &build_script_runs[*other_bs_run_idx];
+                            let run_var = format!("units.\"{}\"", other_bs.info.run_drv_name);
+                            if !dep_bs_outputs.contains(&run_var) {
+                                dep_bs_outputs.push(run_var);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Generate run derivation with dependency build script outputs
+            build_script_run_derivations.push(format!(
+                "    \"{}\" = mkUnit {};\n",
+                bs_run.info.run_drv_name,
+                bs_run.info.run_derivation(&compile_var, &dep_bs_outputs)
+            ));
+
+            // Store the reference for units that depend on this build script
+            build_script_refs.insert(
+                bs_run.unit_index,
+                BuildScriptRef {
+                    run_drv_var: format!("units.\"{}\"", bs_run.info.run_drv_name),
+                    compile_drv_name,
+                    run_drv_name: bs_run.info.run_drv_name.clone(),
+                },
+            );
         }
 
         // Generate derivations for each unit
