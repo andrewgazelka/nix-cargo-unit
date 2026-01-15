@@ -671,11 +671,18 @@ impl UnitDerivation {
             // This includes .rlib, .rmeta, .d files, and .dylib/.so for proc-macros
             // Skip entirely if $out/lib exists (CA-derivation reuse)
             // For proc-macro dylibs on macOS, fix the install name so rustc can load them
+            // Dylibs need execute permission (755) to be dlopen'd
             script.push_str(
                 r#"[ -d "$out/lib" ] || {
   mkdir -p $out/lib
   cp build/* $out/lib/
-  chmod 644 $out/lib/*
+  # Set permissions: 755 for shared libs (dylib/so), 644 for others
+  for f in $out/lib/*; do
+    case "$f" in
+      *.dylib|*.so) chmod 755 "$f" ;;
+      *) chmod 644 "$f" ;;
+    esac
+  done
   # Fix install_name for macOS dylibs (proc-macros) so they can be loaded from $out/lib
   for dylib in $out/lib/*.dylib; do
     [ -f "$dylib" ] && install_name_tool -id "$dylib" "$dylib" 2>/dev/null || true
