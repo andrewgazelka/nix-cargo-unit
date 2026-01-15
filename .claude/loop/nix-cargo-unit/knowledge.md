@@ -551,3 +551,55 @@ Added `is_proc_macro` field for tracking.
 - Windows: `.dll`
 
 Determined by `platform_library_extension(platform)` based on platform triple.
+
+## From feature #12
+
+### Nix Library Structure
+`nix/lib.nix` provides IFD-based per-unit builds:
+- `generateUnitGraph { src, rustToolchain, profile, cargoArgs }` - runs `cargo --unit-graph`
+- `generateNixFromUnitGraph { unitGraphJson, workspaceRoot, ... }` - converts JSON to Nix
+- `buildWorkspace { src, rustToolchain, ... }` - main entry point
+
+### IFD Pattern (Import From Derivation)
+```nix
+# Step 1: Generate JSON at build time
+unitGraphJson = pkgs.runCommand "unit-graph.json" {...} ''
+  cargo build --unit-graph -Z unstable-options > $out
+'';
+
+# Step 2: Generate Nix from JSON
+unitsNix = pkgs.runCommand "units.nix" {...} ''
+  nix-cargo-unit < ${unitGraphJson} > $out
+'';
+
+# Step 3: Import at eval time (IFD - the magic step)
+units = import unitsNix { inherit pkgs rustToolchain src; };
+```
+
+### Flake Outputs
+- `lib.<system>` - pre-configured library for each system
+- `mkLib pkgs` - function to create library for custom pkgs
+- `overlays.default` - overlay that adds `nix-cargo-unit` to pkgs
+
+### Usage Pattern
+```nix
+let
+  cargoUnit = nix-cargo-unit.mkLib pkgs;
+  result = cargoUnit.buildWorkspace {
+    src = ./.;
+    rustToolchain = pkgs.rust-bin.nightly.latest.default;
+    contentAddressed = true;  # Enable CA-derivations
+  };
+in {
+  inherit (result) default roots units;
+  # result.unitGraphJson and result.unitsNix for debugging
+}
+```
+
+### Nightly Rust Required
+`cargo --unit-graph` requires nightly and `-Z unstable-options`. Always use a nightly toolchain for generating the unit graph.
+
+### Environment Variables in Unit Graph Generation
+The runCommand sets:
+- `CARGO_HOME` for cargo cache
+- `SSL_CERT_FILE` for crates.io downloads (uses `pkgs.cacert`)
