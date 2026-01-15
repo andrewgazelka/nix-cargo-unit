@@ -662,17 +662,10 @@ impl UnitDerivation {
         // Note: extern_crate_name is the alias (used in --extern name=), while
         // lib_name is the actual library filename on disk (used in path to .rlib)
         //
-        // IMPORTANT: Skip --extern for crates that have conflicting versions in the
-        // transitive closure. These crates appear multiple times with different hashes
-        // (e.g., due to feature divergence). Let rustc find them via -L search paths
-        // instead, which will match the correct version based on SVH.
+        // Always emit --extern for direct dependencies. Rustc needs explicit --extern
+        // to resolve `extern crate foo;` or `use foo::...` in the source code.
+        // Transitive deps (those only needed by our deps) are resolved via -L search.
         for dep in &self.deps {
-            // Skip non-proc-macro deps that have conflicting versions
-            // (proc-macros always need explicit --extern to load the dylib)
-            if !dep.is_proc_macro && self.conflicting_crates.contains(&dep.lib_name) {
-                continue;
-            }
-
             script.push_str("  --extern ");
             if dep.is_proc_macro {
                 // Proc-macros use the variable set above
