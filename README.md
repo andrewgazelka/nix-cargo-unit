@@ -35,6 +35,17 @@ Per-unit incremental Rust compilation in Nix using Cargo's `--unit-graph` and co
 - Nightly Rust toolchain (for `--unit-graph`)
 - Optional: `ca-derivations` experimental feature for content-addressed outputs
 
+## Known Limitations
+
+### macOS CA Derivations
+
+CA derivations fail on macOS due to code signing ([NixOS/nix#6065](https://github.com/NixOS/nix/issues/6065)). Nix's hash rewriting invalidates signatures, causing SIGKILL.
+
+**Workarounds:**
+- Use `contentAddressed = false` (recommended)
+- Disable SIP + AMFI (dev machines only)
+- Build on Linux remote builder with `--system x86_64-linux`
+
 ## How it works
 
 1. Runs `cargo build --unit-graph` to get the compilation DAG
