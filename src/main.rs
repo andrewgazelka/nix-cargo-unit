@@ -18,6 +18,18 @@ struct Cli {
     /// Enable content-addressed derivations (CA-derivations)
     #[arg(long)]
     content_addressed: bool,
+
+    /// Enable cross-compilation mode (use hostRustToolchain for proc-macros)
+    #[arg(long)]
+    cross_compile: bool,
+
+    /// Host platform triple (for proc-macros and build scripts in cross-compilation)
+    #[arg(long)]
+    host_platform: Option<String>,
+
+    /// Target platform triple (for regular crates in cross-compilation)
+    #[arg(long)]
+    target_platform: Option<String>,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -33,10 +45,19 @@ fn main() -> color_eyre::Result<()> {
 
     match cli.format.as_str() {
         "nix" => {
-            let config = NixGenConfig {
+            let mut config = NixGenConfig {
                 workspace_root: cli.workspace_root,
                 content_addressed: cli.content_addressed,
+                ..Default::default()
             };
+
+            // Configure cross-compilation if enabled
+            if cli.cross_compile {
+                config.cross_compiling = true;
+                config.host_platform = cli.host_platform;
+                config.target_platform = cli.target_platform;
+            }
+
             let generator = NixGenerator::new(config);
             let nix = generator.generate(&graph);
             println!("{nix}");

@@ -238,6 +238,9 @@ pub struct UnitDerivation {
     /// Whether this is a test build.
     pub is_test: bool,
 
+    /// Whether this is a proc-macro.
+    pub is_proc_macro: bool,
+
     /// Dependencies with extern crate info.
     pub deps: Vec<DepRef>,
 
@@ -249,6 +252,10 @@ pub struct UnitDerivation {
 
     /// Whether to use content-addressed derivations.
     pub content_addressed: bool,
+
+    /// The Nix variable for the toolchain to use.
+    /// Either "rustToolchain" or "hostRustToolchain" for cross-compilation.
+    pub toolchain_var: String,
 }
 
 impl UnitDerivation {
@@ -256,7 +263,13 @@ impl UnitDerivation {
     ///
     /// The `workspace_root` is used to remap absolute paths to Nix source paths.
     /// The `content_addressed` flag enables CA-derivation attributes.
-    pub fn from_unit(unit: &Unit, workspace_root: &str, content_addressed: bool) -> Self {
+    /// The `toolchain_var` specifies which toolchain to use (for cross-compilation).
+    pub fn from_unit(
+        unit: &Unit,
+        workspace_root: &str,
+        content_addressed: bool,
+        toolchain_var: &str,
+    ) -> Self {
         let name = unit.derivation_name();
         let pname = unit.target.name.clone();
         let version = unit.package_version().unwrap_or("0.0.0").to_string();
@@ -277,10 +290,12 @@ impl UnitDerivation {
             features: unit.features.clone(),
             opt_level: unit.profile.opt_level.clone(),
             is_test: unit.is_test(),
+            is_proc_macro: unit.is_proc_macro(),
             deps: Vec::new(),
             build_script_ref: None,
             rustc_flags,
             content_addressed,
+            toolchain_var: toolchain_var.to_string(),
         }
     }
 
@@ -315,7 +330,8 @@ impl UnitDerivation {
         }
 
         // Native build inputs (rust toolchain)
-        attrs.expr("nativeBuildInputs", "[ rustToolchain ]");
+        // Use hostRustToolchain for proc-macros when cross-compiling
+        attrs.expr("nativeBuildInputs", &format!("[ {} ]", self.toolchain_var));
 
         // Content-addressed derivation attributes
         if self.content_addressed {
@@ -440,6 +456,16 @@ pub struct NixGenConfig {
 
     /// Whether to include content-addressed derivation attributes.
     pub content_addressed: bool,
+
+    /// Whether cross-compilation is enabled.
+    /// When true, proc-macros and build scripts use `hostRustToolchain`.
+    pub cross_compiling: bool,
+
+    /// The target platform triple (for regular crates).
+    pub target_platform: Option<String>,
+
+    /// The host platform triple (for proc-macros and build scripts).
+    pub host_platform: Option<String>,
 }
 
 impl Default for NixGenConfig {
@@ -447,6 +473,31 @@ impl Default for NixGenConfig {
         Self {
             workspace_root: String::new(),
             content_addressed: false,
+            cross_compiling: false,
+            target_platform: None,
+            host_platform: None,
+        }
+    }
+}
+
+impl NixGenConfig {
+    /// Creates a config for cross-compilation.
+    pub fn with_cross_compilation(mut self, host: &str, target: &str) -> Self {
+        self.cross_compiling = true;
+        self.host_platform = Some(host.to_string());
+        self.target_platform = Some(target.to_string());
+        self
+    }
+
+    /// Returns the toolchain variable name for a given unit.
+    ///
+    /// - `"hostRustToolchain"` for proc-macros and build scripts when cross-compiling
+    /// - `"rustToolchain"` otherwise
+    pub fn toolchain_var_for_unit(&self, unit: &Unit) -> &'static str {
+        if self.cross_compiling && crate::proc_macro::requires_host_toolchain(unit) {
+            "hostRustToolchain"
+        } else {
+            "rustToolchain"
         }
     }
 }
@@ -471,7 +522,12 @@ impl NixGenerator {
         out.push_str("# Do not edit manually\n\n");
 
         // Function signature
-        out.push_str("{ pkgs, rustToolchain, src }:\n\n");
+        // Include hostRustToolchain parameter for cross-compilation support
+        if self.config.cross_compiling {
+            out.push_str("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:\n\n");
+        } else {
+            out.push_str("{ pkgs, rustToolchain, src }:\n\n");
+        }
 
         // Let block
         out.push_str("let\n");
@@ -543,10 +599,12 @@ impl NixGenerator {
                 continue;
             }
 
+            let toolchain_var = self.config.toolchain_var_for_unit(unit);
             let mut drv = UnitDerivation::from_unit(
                 unit,
                 &self.config.workspace_root,
                 self.config.content_addressed,
+                toolchain_var,
             );
 
             // Wire up dependencies, and detect if any dependency is a build script
@@ -693,13 +751,14 @@ mod tests {
         let graph = parse_unit_graph(json);
         let unit = &graph.units[0];
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
 
         assert_eq!(drv.pname, "my_crate");
         assert_eq!(drv.version, "0.1.0");
         assert_eq!(drv.edition, "2021");
         assert_eq!(drv.features, vec!["default", "std"]);
         assert!(drv.src_path.contains("${src}"));
+        assert_eq!(drv.toolchain_var, "rustToolchain");
     }
 
     #[test]
@@ -727,6 +786,7 @@ mod tests {
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
+            ..Default::default()
         };
 
         let generator = NixGenerator::new(config);
@@ -789,6 +849,7 @@ mod tests {
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
+            ..Default::default()
         };
 
         let generator = NixGenerator::new(config);
@@ -870,6 +931,7 @@ mod tests {
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
+            ..Default::default()
         };
 
         let generator = NixGenerator::new(config);
@@ -906,10 +968,12 @@ mod tests {
             features: vec![],
             opt_level: "0".to_string(),
             is_test: false,
+            is_proc_macro: false,
             deps: vec![],
             build_script_ref: None,
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
+            toolchain_var: "rustToolchain".to_string(),
         };
 
         // Add a dependency
@@ -950,7 +1014,7 @@ mod tests {
         let graph = parse_unit_graph(json);
         let unit = &graph.units[0];
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
         let build_phase = drv.generate_build_phase();
 
         // Check for proper flag formatting
@@ -990,14 +1054,14 @@ mod tests {
         let unit = &graph.units[0];
 
         // Without content-addressed
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
         let nix = drv.to_nix();
         assert!(!nix.contains("__contentAddressed"));
         assert!(!nix.contains("outputHashMode"));
         assert!(!nix.contains("outputHashAlgo"));
 
         // With content-addressed
-        let drv_ca = UnitDerivation::from_unit(unit, "/workspace", true);
+        let drv_ca = UnitDerivation::from_unit(unit, "/workspace", true, "rustToolchain");
         let nix_ca = drv_ca.to_nix();
         assert!(nix_ca.contains("__contentAddressed = true"));
         assert!(nix_ca.contains("outputHashMode = \"recursive\""));
@@ -1031,6 +1095,7 @@ mod tests {
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
+            ..Default::default()
         };
         let nix = NixGenerator::new(config).generate(&graph);
         assert!(!nix.contains("__contentAddressed"));
@@ -1039,6 +1104,7 @@ mod tests {
         let config_ca = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: true,
+            ..Default::default()
         };
         let nix_ca = NixGenerator::new(config_ca).generate(&graph);
         assert!(nix_ca.contains("__contentAddressed = true"));
@@ -1090,6 +1156,7 @@ mod tests {
         let config = NixGenConfig {
             workspace_root: "/workspace".to_string(),
             content_addressed: false,
+            ..Default::default()
         };
 
         let generator = NixGenerator::new(config);
@@ -1127,6 +1194,7 @@ mod tests {
             features: vec![],
             opt_level: "0".to_string(),
             is_test: false,
+            is_proc_macro: false,
             deps: vec![],
             build_script_ref: Some(BuildScriptRef {
                 run_drv_var: "units.\"my-build-script-run\"".to_string(),
@@ -1135,6 +1203,7 @@ mod tests {
             }),
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
+            toolchain_var: "rustToolchain".to_string(),
         };
 
         // Add a regular dependency too
@@ -1157,5 +1226,120 @@ mod tests {
         assert!(build_phase.contains("BUILD_SCRIPT_FLAGS"));
         assert!(build_phase.contains("units.\"my-build-script-run\""));
         assert!(build_phase.contains("rustc-cfg"));
+    }
+
+    #[test]
+    fn test_proc_macro_host_toolchain() {
+        // Test that proc-macros use hostRustToolchain in cross-compilation
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "serde_derive 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                    "target": {
+                        "kind": ["proc-macro"],
+                        "crate_types": ["proc-macro"],
+                        "name": "serde_derive",
+                        "src_path": "/registry/serde_derive/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [],
+                    "platform": "aarch64-apple-darwin"
+                },
+                {
+                    "pkg_id": "my_app 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "name": "my_app",
+                        "src_path": "/workspace/src/main.rs",
+                        "edition": "2024"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "serde_derive", "public": false}
+                    ]
+                }
+            ],
+            "roots": [1]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+
+        // Without cross-compilation: both use rustToolchain
+        let config = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+            cross_compiling: false,
+            ..Default::default()
+        };
+        let nix = NixGenerator::new(config).generate(&graph);
+
+        // Should use rustToolchain for both
+        assert!(nix.contains("{ pkgs, rustToolchain, src }:"));
+        assert!(!nix.contains("hostRustToolchain"));
+
+        // With cross-compilation: proc-macro uses hostRustToolchain
+        let config_cross = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+            cross_compiling: true,
+            host_platform: Some("aarch64-apple-darwin".to_string()),
+            target_platform: Some("x86_64-unknown-linux-gnu".to_string()),
+        };
+        let nix_cross = NixGenerator::new(config_cross).generate(&graph);
+
+        // Should have hostRustToolchain in function signature
+        assert!(nix_cross.contains("hostRustToolchain"));
+        assert!(
+            nix_cross.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:")
+        );
+
+        // Proc-macro should use hostRustToolchain
+        // Regular bin should use rustToolchain
+        // Check that both toolchains appear in nativeBuildInputs
+        assert!(nix_cross.contains("nativeBuildInputs = [ hostRustToolchain ]"));
+        assert!(nix_cross.contains("nativeBuildInputs = [ rustToolchain ]"));
+    }
+
+    #[test]
+    fn test_proc_macro_output_path() {
+        // Test that proc-macros output to shared library path
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "my_macro 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["proc-macro"],
+                        "crate_types": ["proc-macro"],
+                        "name": "my_macro",
+                        "src_path": "/workspace/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [],
+                    "platform": "x86_64-unknown-linux-gnu"
+                }
+            ],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+        let unit = &graph.units[0];
+
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
+        let build_phase = drv.generate_build_phase();
+
+        // Should output to shared library path (.so)
+        assert!(build_phase.contains("$out/lib/libmy_macro.so"));
+        assert!(drv.is_proc_macro);
     }
 }

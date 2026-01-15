@@ -422,3 +422,79 @@ Run derivation parses these directives to files:
 
 ### escape_nix_multiline is public
 `nix_gen::escape_nix_multiline(s)` is now public for use by build_script module.
+
+## From feature #9
+
+### BuildScriptOutput Struct
+`BuildScriptOutput` parses the structured output files from build script run derivations:
+```rust
+pub struct BuildScriptOutput {
+    pub rustc_cfgs: Vec<String>,           // From rustc-cfg file
+    pub rustc_link_libs: Vec<String>,      // From rustc-link-lib file
+    pub rustc_link_searches: Vec<String>,  // From rustc-link-search file
+    pub rustc_envs: Vec<(String, String)>, // From rustc-env file (KEY=VALUE)
+    pub rustc_cdylib_link_args: Vec<String>, // From rustc-cdylib-link-arg file
+}
+```
+
+### Parsing Methods
+Individual file parsers for each directive type:
+- `BuildScriptOutput::parse_cfgs(contents)` - parses cfg expressions
+- `BuildScriptOutput::parse_link_libs(contents)` - parses `[KIND=]NAME`
+- `BuildScriptOutput::parse_link_searches(contents)` - parses `[KIND=]PATH`
+- `BuildScriptOutput::parse_envs(contents)` - parses `KEY=VALUE` pairs
+- `BuildScriptOutput::parse_cdylib_link_args(contents)` - parses linker args
+
+All parsers skip empty lines and trim whitespace.
+
+### Converting to rustc Flags
+`output.to_rustc_args()` generates rustc CLI arguments:
+- `--cfg` for each cfg
+- `-l` for each link lib
+- `-L` for each link search
+- `-C link-arg=` for each cdylib link arg
+
+Note: `rustc_envs` are NOT included in rustc args (they're environment vars, not flags).
+
+### Nix Shell Script Generation
+`BuildScriptOutput::generate_nix_flag_reader(var)` generates shell script to read build script outputs at derivation build time:
+- Reads each output file and appends to `BUILD_SCRIPT_FLAGS`
+- Sets `OUT_DIR` to the out-dir subdirectory
+- Handles missing files gracefully with `if [ -f ]` checks
+
+### Nix Expression Generation
+`BuildScriptOutput::generate_nix_expr_reader(var)` generates a Nix expression that reads outputs using `builtins.readFile` - useful for structuredAttrs or eval-time access.
+
+## From feature #10
+
+### BuildScriptRef Struct
+`BuildScriptRef` tracks build script derivation references for dependent units:
+```rust
+pub struct BuildScriptRef {
+    pub run_drv_var: String,      // e.g., "units.\"my-crate-build-script-run-...\""
+    pub compile_drv_name: String, // e.g., "my-crate-build-script-..."
+    pub run_drv_name: String,     // e.g., "my-crate-build-script-run-..."
+}
+```
+
+### Build Script Wiring in NixGenerator
+`NixGenerator::generate()` now:
+1. First pass: identifies all `mode == "run-custom-build"` units
+2. Generates compile and run derivations for each build script
+3. Creates a map from unit index to `BuildScriptRef`
+4. Second pass: for regular units, checks if any dependency is a build script
+5. Skips build script dependencies from `--extern` flags (they're not linkable crates)
+6. Sets `build_script_ref` on units that depend on build scripts
+
+### Build Phase Integration
+Units with a `build_script_ref`:
+1. Include the run derivation in `buildInputs`
+2. Initialize `BUILD_SCRIPT_FLAGS=""`
+3. Call `BuildScriptOutput::generate_nix_flag_reader()` to read output files
+4. Append `$BUILD_SCRIPT_FLAGS` to the rustc command
+
+### Build Script Dependency Detection
+Build scripts are identified by `unit.mode == "run-custom-build"`. When a regular unit has a dependency with this mode, it gets the build script's outputs wired into its rustc invocation.
+
+### Important: Build Scripts Are Not Extern Dependencies
+Build script execution units should NOT be added as `--extern` dependencies. They produce configuration, not linkable artifacts. The generated code correctly filters them out from the regular dependency wiring.
