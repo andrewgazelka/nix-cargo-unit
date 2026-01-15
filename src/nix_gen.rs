@@ -4,6 +4,7 @@
 //! from cargo unit graph data. It focuses on proper escaping, composability,
 //! and producing readable output.
 
+use crate::build_script::{BuildScriptInfo, BuildScriptOutput};
 use crate::rustc_flags::RustcFlags;
 use crate::unit_graph::{Unit, UnitGraph};
 
@@ -194,6 +195,19 @@ pub struct DepRef {
     pub is_proc_macro: bool,
 }
 
+/// A build script output reference for a unit.
+#[derive(Debug, Clone)]
+pub struct BuildScriptRef {
+    /// Nix variable name for the build script run derivation.
+    pub run_drv_var: String,
+
+    /// Derivation name for the compile derivation.
+    pub compile_drv_name: String,
+
+    /// Derivation name for the run derivation.
+    pub run_drv_name: String,
+}
+
 /// A builder for a single unit derivation.
 #[derive(Debug)]
 pub struct UnitDerivation {
@@ -226,6 +240,9 @@ pub struct UnitDerivation {
 
     /// Dependencies with extern crate info.
     pub deps: Vec<DepRef>,
+
+    /// Build script outputs this unit depends on (if any).
+    pub build_script_ref: Option<BuildScriptRef>,
 
     /// The rustc flags (precomputed).
     pub rustc_flags: RustcFlags,
@@ -261,9 +278,15 @@ impl UnitDerivation {
             opt_level: unit.profile.opt_level.clone(),
             is_test: unit.is_test(),
             deps: Vec::new(),
+            build_script_ref: None,
             rustc_flags,
             content_addressed,
         }
+    }
+
+    /// Sets the build script reference for this unit.
+    pub fn set_build_script_ref(&mut self, build_script_ref: BuildScriptRef) {
+        self.build_script_ref = Some(build_script_ref);
     }
 
     /// Adds a dependency reference with extern crate info.
@@ -279,8 +302,13 @@ impl UnitDerivation {
         attrs.string("version", &self.version);
 
         // Build inputs (dependencies) - use the nix_var for each dep
-        if !self.deps.is_empty() {
-            let dep_vars: Vec<String> = self.deps.iter().map(|d| d.nix_var.clone()).collect();
+        // Also include build script run derivation if present
+        let mut dep_vars: Vec<String> = self.deps.iter().map(|d| d.nix_var.clone()).collect();
+        if let Some(ref bs_ref) = self.build_script_ref {
+            dep_vars.push(bs_ref.run_drv_var.clone());
+        }
+
+        if !dep_vars.is_empty() {
             attrs.expr_list("buildInputs", &dep_vars);
         } else {
             attrs.expr("buildInputs", "[]");
@@ -315,6 +343,18 @@ impl UnitDerivation {
             script.push_str("mkdir -p $out/bin\n");
         } else {
             script.push_str("mkdir -p $out/lib\n");
+        }
+
+        // Initialize build script flags variable
+        script.push_str("BUILD_SCRIPT_FLAGS=\"\"\n");
+
+        // Read build script outputs if this unit depends on a build script
+        if let Some(ref bs_ref) = self.build_script_ref {
+            script.push_str("\n");
+            script.push_str(&BuildScriptOutput::generate_nix_flag_reader(
+                &bs_ref.run_drv_var,
+            ));
+            script.push_str("\n");
         }
 
         script.push_str("rustc \\\n");
@@ -383,6 +423,10 @@ impl UnitDerivation {
         };
         script.push_str("  -o ");
         script.push_str(&output_name);
+        script.push_str(" \\\n");
+
+        // Add build script flags (expands to flags read from build script output)
+        script.push_str("  $BUILD_SCRIPT_FLAGS");
 
         script
     }
@@ -441,19 +485,83 @@ impl NixGenerator {
         // Pre-compute derivation names for all units (needed for dependency resolution)
         let drv_names: Vec<String> = graph.units.iter().map(|u| u.derivation_name()).collect();
 
+        // First pass: identify build script units and generate their compile/run derivations
+        // Build a map from unit index -> BuildScriptRef for units that depend on build scripts
+        let mut build_script_derivations: Vec<String> = Vec::new();
+        let mut build_script_refs: std::collections::HashMap<usize, BuildScriptRef> =
+            std::collections::HashMap::new();
+
+        for (i, unit) in graph.units.iter().enumerate() {
+            if unit.mode == "run-custom-build" {
+                // This is a build script execution unit
+                let info = BuildScriptInfo::from_unit(
+                    unit,
+                    &self.config.workspace_root,
+                    self.config.content_addressed,
+                );
+                if let Some(info) = info {
+                    // Generate compile derivation
+                    build_script_derivations.push(format!(
+                        "    \"{}\" = mkUnit {};\n",
+                        info.compile_drv_name,
+                        info.compile_derivation()
+                    ));
+
+                    // Generate run derivation (depends on compile derivation)
+                    let compile_var = format!("units.\"{}\"", info.compile_drv_name);
+                    build_script_derivations.push(format!(
+                        "    \"{}\" = mkUnit {};\n",
+                        info.run_drv_name,
+                        info.run_derivation(&compile_var)
+                    ));
+
+                    // Store the reference for units that depend on this build script
+                    build_script_refs.insert(
+                        i,
+                        BuildScriptRef {
+                            run_drv_var: format!("units.\"{}\"", info.run_drv_name),
+                            compile_drv_name: info.compile_drv_name,
+                            run_drv_name: info.run_drv_name,
+                        },
+                    );
+                }
+            }
+        }
+
         // Generate derivations for each unit
         out.push_str("  units = {\n");
 
+        // First, output all build script derivations
+        for drv_str in &build_script_derivations {
+            out.push_str(drv_str);
+            out.push('\n');
+        }
+
         for (i, unit) in graph.units.iter().enumerate() {
+            // Skip build script run units - they're already generated above
+            if unit.mode == "run-custom-build" {
+                continue;
+            }
+
             let mut drv = UnitDerivation::from_unit(
                 unit,
                 &self.config.workspace_root,
                 self.config.content_addressed,
             );
 
-            // Wire up dependencies
+            // Wire up dependencies, and detect if any dependency is a build script
             for dep in &unit.dependencies {
                 if let Some(dep_unit) = graph.units.get(dep.index) {
+                    // Check if this dependency is a build script execution unit
+                    if dep_unit.mode == "run-custom-build" {
+                        // This unit depends on a build script - wire up the build script outputs
+                        if let Some(bs_ref) = build_script_refs.get(&dep.index) {
+                            drv.set_build_script_ref(bs_ref.clone());
+                        }
+                        // Don't add build script as a regular extern dependency
+                        continue;
+                    }
+
                     let dep_drv_name = &drv_names[dep.index];
                     drv.add_dep(DepRef {
                         nix_var: format!("units.\"{}\"", dep_drv_name),
@@ -799,6 +907,7 @@ mod tests {
             opt_level: "0".to_string(),
             is_test: false,
             deps: vec![],
+            build_script_ref: None,
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
         };
@@ -935,5 +1044,118 @@ mod tests {
         assert!(nix_ca.contains("__contentAddressed = true"));
         assert!(nix_ca.contains("outputHashMode = \"recursive\""));
         assert!(nix_ca.contains("outputHashAlgo = \"sha256\""));
+    }
+
+    #[test]
+    fn test_build_script_output_wiring() {
+        // Test a unit graph where a library depends on a build script
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "my-crate 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["custom-build"],
+                        "crate_types": ["bin"],
+                        "name": "build-script-build",
+                        "src_path": "/workspace/build.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": ["feature-x"],
+                    "mode": "run-custom-build",
+                    "dependencies": []
+                },
+                {
+                    "pkg_id": "my-crate 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "name": "my_crate",
+                        "src_path": "/workspace/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": ["feature-x"],
+                    "mode": "build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "build_script_build", "public": false}
+                    ]
+                }
+            ],
+            "roots": [1]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+        let config = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+        };
+
+        let generator = NixGenerator::new(config);
+        let nix = generator.generate(&graph);
+
+        // Should have build script compile derivation
+        assert!(nix.contains("my-crate-build-script-"));
+        assert!(nix.contains("pname = \"my-crate-build-script\""));
+
+        // Should have build script run derivation
+        assert!(nix.contains("my-crate-build-script-run-"));
+        assert!(nix.contains("pname = \"my-crate-build-script-output\""));
+
+        // The library should read build script outputs
+        assert!(nix.contains("BUILD_SCRIPT_FLAGS"));
+        assert!(nix.contains("# Read build script outputs"));
+        assert!(nix.contains("rustc-cfg"));
+
+        // Library build phase should include $BUILD_SCRIPT_FLAGS
+        assert!(nix.contains("$BUILD_SCRIPT_FLAGS"));
+
+        // Library should have build script run derivation in buildInputs
+        assert!(nix.contains("my-crate-build-script-run-"));
+    }
+
+    #[test]
+    fn test_build_script_ref_in_build_inputs() {
+        let mut drv = UnitDerivation {
+            name: "test-0.1.0-abc123".to_string(),
+            pname: "test".to_string(),
+            version: "0.1.0".to_string(),
+            edition: "2024".to_string(),
+            crate_types: vec!["lib".to_string()],
+            src_path: "${src}/src/lib.rs".to_string(),
+            features: vec![],
+            opt_level: "0".to_string(),
+            is_test: false,
+            deps: vec![],
+            build_script_ref: Some(BuildScriptRef {
+                run_drv_var: "units.\"my-build-script-run\"".to_string(),
+                compile_drv_name: "my-build-script".to_string(),
+                run_drv_name: "my-build-script-run".to_string(),
+            }),
+            rustc_flags: RustcFlags::new(),
+            content_addressed: false,
+        };
+
+        // Add a regular dependency too
+        drv.add_dep(DepRef {
+            nix_var: "units.\"dep-0.1.0-xyz789\"".to_string(),
+            extern_crate_name: "dep".to_string(),
+            derivation_name: "dep-0.1.0-xyz789".to_string(),
+            is_proc_macro: false,
+        });
+
+        let nix = drv.to_nix();
+
+        // Should have both regular dep and build script in buildInputs
+        assert!(nix.contains("buildInputs = ["));
+        assert!(nix.contains("units.\"dep-0.1.0-xyz789\""));
+        assert!(nix.contains("units.\"my-build-script-run\""));
+
+        // Build phase should read build script outputs
+        let build_phase = drv.generate_build_phase();
+        assert!(build_phase.contains("BUILD_SCRIPT_FLAGS"));
+        assert!(build_phase.contains("units.\"my-build-script-run\""));
+        assert!(build_phase.contains("rustc-cfg"));
     }
 }
