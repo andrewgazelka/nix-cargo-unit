@@ -393,6 +393,8 @@ impl UnitDerivation {
     /// The `content_addressed` flag enables CA-derivation attributes.
     /// The `toolchain_var` specifies which toolchain to use (for cross-compilation).
     /// The `drv_name` and `identity_hash` should be pre-computed for efficiency.
+    /// The `is_external_dep` flag indicates if this is a dependency (registry/git)
+    /// vs a local workspace crate; external deps get `--cap-lints warn`.
     pub fn from_unit(
         unit: &Unit,
         workspace_root: &str,
@@ -400,6 +402,7 @@ impl UnitDerivation {
         toolchain_var: &str,
         drv_name: &str,
         identity_hash: &str,
+        is_external_dep: bool,
     ) -> Self {
         let pname = unit.target.name.clone();
         let version = unit.package_version().unwrap_or("0.0.0").to_string();
@@ -411,6 +414,12 @@ impl UnitDerivation {
         let mut rustc_flags = RustcFlags::from_unit(unit);
         // Add metadata hash for stable crate identity across compilations
         rustc_flags.add_metadata(identity_hash);
+
+        // Cap lints to warn for external dependencies (same as cargo does)
+        // This prevents #[deny(dead_code)] etc from breaking dependency builds
+        if is_external_dep {
+            rustc_flags.cap_lints_for_dependency();
+        }
 
         Self {
             name: drv_name.to_owned(),
@@ -940,6 +949,7 @@ impl NixGenerator {
                 toolchain_var,
                 &drv_names[i],
                 &identity_hashes[i],
+                unit.is_external_dependency(),
             );
 
             // Wire up dependencies, and detect if any dependency is a build script
@@ -1162,6 +1172,7 @@ mod tests {
             "rustToolchain",
             &drv_name,
             &identity_hash,
+            false, // not an external dep (path source)
         );
 
         assert_eq!(drv.pname, "my_crate");
@@ -1437,6 +1448,7 @@ mod tests {
             "rustToolchain",
             &drv_name,
             &identity_hash,
+            false, // not an external dep
         );
         let build_phase = drv.generate_build_phase();
 
@@ -1486,6 +1498,7 @@ mod tests {
             "rustToolchain",
             &drv_name,
             &identity_hash,
+            false, // not an external dep
         );
         let nix = drv.to_nix();
         assert!(!nix.contains("__contentAddressed"));
@@ -1500,6 +1513,7 @@ mod tests {
             "rustToolchain",
             &drv_name,
             &identity_hash,
+            false, // not an external dep
         );
         let nix_ca = drv_ca.to_nix();
         assert!(nix_ca.contains("__contentAddressed = true"));
@@ -1829,6 +1843,7 @@ mod tests {
             "rustToolchain",
             &drv_name,
             &identity_hash,
+            false, // not an external dep
         );
         let build_phase = drv.generate_build_phase();
 

@@ -185,6 +185,16 @@ impl RustcFlags {
         self.push_codegen_flag("extra-filename", &format!("-{hash}"));
     }
 
+    /// Caps lint levels to warnings for external dependencies.
+    ///
+    /// This prevents lint errors (like dead_code or unused_imports set to deny)
+    /// from failing builds of external crates. Cargo does this automatically
+    /// for all dependencies.
+    pub fn cap_lints_for_dependency(&mut self) {
+        self.push_arg("--cap-lints");
+        self.push_arg("warn");
+    }
+
     /// Adds an extern crate reference.
     ///
     /// This generates: `--extern name=path`

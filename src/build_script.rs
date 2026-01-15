@@ -587,27 +587,38 @@ export CARGO_CFG_UNIX
             compile_drv_var, self.target_name
         ));
 
-        // Parse cargo: directives
+        // Parse cargo: and cargo:: directives (Cargo supports both formats)
+        // - cargo:key=value is the legacy format
+        // - cargo::key=value is the new format (Rust 1.77+)
         // Use ''${...} for bash parameter expansion to prevent Nix interpolation
         // ${...} without '' would be interpreted as Nix interpolation
-        let parse_script = r#"  case "$line" in
+        let parse_script = r#"  # Normalize cargo:: to cargo: for unified parsing
+  normalized_line="$line"
+  case "$line" in
+    cargo::*)
+      # Strip one colon: cargo::foo=bar -> cargo:foo=bar
+      normalized_line="cargo:''${line#cargo::}"
+      ;;
+  esac
+
+  case "$normalized_line" in
     cargo:rustc-cfg=*)
-      echo "''${line#cargo:rustc-cfg=}" >> $out/rustc-cfg
+      echo "''${normalized_line#cargo:rustc-cfg=}" >> $out/rustc-cfg
       ;;
     cargo:rustc-link-lib=*)
-      echo "''${line#cargo:rustc-link-lib=}" >> $out/rustc-link-lib
+      echo "''${normalized_line#cargo:rustc-link-lib=}" >> $out/rustc-link-lib
       ;;
     cargo:rustc-link-search=*)
-      echo "''${line#cargo:rustc-link-search=}" >> $out/rustc-link-search
+      echo "''${normalized_line#cargo:rustc-link-search=}" >> $out/rustc-link-search
       ;;
     cargo:rustc-env=*)
-      echo "''${line#cargo:rustc-env=}" >> $out/rustc-env
+      echo "''${normalized_line#cargo:rustc-env=}" >> $out/rustc-env
       ;;
     cargo:rustc-cdylib-link-arg=*)
-      echo "''${line#cargo:rustc-cdylib-link-arg=}" >> $out/rustc-cdylib-link-arg
+      echo "''${normalized_line#cargo:rustc-cdylib-link-arg=}" >> $out/rustc-cdylib-link-arg
       ;;
     cargo:warning=*)
-      echo "Build script warning: ''${line#cargo:warning=}" >&2
+      echo "Build script warning: ''${normalized_line#cargo:warning=}" >&2
       ;;
     cargo:rerun-if-changed=*|cargo:rerun-if-env-changed=*)
       # Ignored in Nix (content-addressed handles this)
@@ -615,7 +626,7 @@ export CARGO_CFG_UNIX
     cargo:*)
       # Capture generic cargo metadata (key=value) for DEP_* passing
       # These become DEP_<LINKS>_<KEY>=<value> for dependent build scripts
-      meta="''${line#cargo:}"
+      meta="''${normalized_line#cargo:}"
       if [[ "$meta" == *"="* ]]; then
         echo "$meta" >> $out/cargo-metadata
       fi

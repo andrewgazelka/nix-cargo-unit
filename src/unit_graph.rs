@@ -470,6 +470,29 @@ impl Unit {
         parts.next() // return version
     }
 
+    /// Returns true if this unit is from an external source (registry or git).
+    ///
+    /// External dependencies get `--cap-lints warn` to prevent lint errors from
+    /// breaking builds. Local path dependencies (workspace crates) don't get this
+    /// since we want to see lint errors in our own code.
+    pub fn is_external_dependency(&self) -> bool {
+        // Check new format first: "registry+..." or "git+..."
+        if self.pkg_id.starts_with("registry+") || self.pkg_id.starts_with("git+") {
+            return true;
+        }
+
+        // Check old format: "name version (registry+...)" or "name version (git+...)"
+        if let Some(paren_pos) = self.pkg_id.find('(') {
+            let source = &self.pkg_id[paren_pos + 1..];
+            if source.starts_with("registry+") || source.starts_with("git+") {
+                return true;
+            }
+        }
+
+        // path+file:// sources are local workspace crates
+        false
+    }
+
     /// Computes a unique identity hash for this unit.
     ///
     /// The identity is a SHA-256 hash of (pkg_id, sorted features, profile key fields, mode, target name, crate types).
