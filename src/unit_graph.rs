@@ -139,17 +139,12 @@ pub struct Profile {
 }
 
 /// LTO setting (can be string "false"/"true"/"thin"/"fat" or boolean).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub enum LtoSetting {
+    #[default]
     Off,
     Thin,
     Fat,
-}
-
-impl Default for LtoSetting {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl<'de> serde::Deserialize<'de> for LtoSetting {
@@ -194,19 +189,14 @@ impl<'de> serde::Deserialize<'de> for LtoSetting {
 }
 
 /// Debug information level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub enum DebugInfo {
+    #[default]
     None,
     LineDirectivesOnly,
     LineTablesOnly,
     Limited,
     Full,
-}
-
-impl Default for DebugInfo {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl<'de> serde::Deserialize<'de> for DebugInfo {
@@ -295,17 +285,12 @@ pub enum PanicStrategy {
 }
 
 /// Symbol stripping setting.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub enum StripSetting {
+    #[default]
     None,
     Debuginfo,
     Symbols,
-}
-
-impl Default for StripSetting {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl StripSetting {

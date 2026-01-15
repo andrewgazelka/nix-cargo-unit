@@ -337,7 +337,7 @@ impl BuildScriptInfo {
         attrs.multiline_interpolated("buildPhase", &build_phase);
         attrs.multiline(
             "installPhase",
-            "mkdir -p $out/bin\ncp build/build-script $out/bin/",
+            "[ -d \"$out/bin\" ] || mkdir -p $out/bin\n[ -f \"$out/bin/build-script\" ] || cp build/build-script $out/bin/",
         );
 
         attrs.render(2)
@@ -411,7 +411,7 @@ impl BuildScriptInfo {
         let build_phase = self.generate_run_phase(&shell_compile_var);
         // Use multiline_interpolated so ${...} gets interpolated
         attrs.multiline_interpolated("buildPhase", &build_phase);
-        attrs.multiline("installPhase", "mkdir -p $out");
+        attrs.multiline("installPhase", "[ -d \"$out\" ] || mkdir -p $out");
 
         attrs.render(2)
     }
@@ -420,8 +420,8 @@ impl BuildScriptInfo {
     fn generate_run_phase(&self, compile_drv_var: &str) -> String {
         let mut script = String::new();
 
-        // Create output directories
-        script.push_str("mkdir -p $out/out-dir\n");
+        // Create output directories (conditional for CA-derivation reuse)
+        script.push_str("[ -d \"$out/out-dir\" ] || mkdir -p $out/out-dir\n");
 
         // Set up environment variables that build scripts expect
         script.push_str("export OUT_DIR=$out/out-dir\n");
@@ -562,7 +562,10 @@ export CARGO_CFG_UNIX
 done < "$BUILD_SCRIPT_OUTPUT"
 
 # Create empty files if they don't exist (for consistent interface)
-touch $out/rustc-cfg $out/rustc-link-lib $out/rustc-link-search $out/rustc-env
+# Use conditional touch to handle CA-derivation reuse where $out may already exist read-only
+for f in rustc-cfg rustc-link-lib rustc-link-search rustc-env; do
+  [ -f "$out/$f" ] || touch "$out/$f"
+done
 
 # Exit with build script's exit code only if it actually failed
 if [ $BUILD_SCRIPT_EXIT -ne 0 ]; then

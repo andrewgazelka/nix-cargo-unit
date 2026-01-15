@@ -182,6 +182,8 @@ impl NixAttrSet {
         self.bool("__contentAddressed", true);
         self.string("outputHashMode", "recursive");
         self.string("outputHashAlgo", "sha256");
+        // Skip fixup phase - it runs chmod which fails on read-only CA store paths
+        self.bool("dontFixup", true);
         self
     }
 
@@ -486,11 +488,11 @@ impl UnitDerivation {
 
         // Read build script outputs if this unit depends on a build script
         if let Some(ref bs_ref) = self.build_script_ref {
-            script.push_str("\n");
+            script.push('\n');
             // Wrap in ${...} for Nix interpolation in multiline strings
             let shell_var = format!("${{{}}}", bs_ref.run_drv_var);
             script.push_str(&BuildScriptOutput::generate_nix_flag_reader(&shell_var));
-            script.push_str("\n");
+            script.push('\n');
         }
 
         script.push_str("rustc \\\n");
@@ -588,13 +590,17 @@ impl UnitDerivation {
         let mut script = String::new();
 
         if self.crate_types.contains(&"bin".to_string()) {
-            script.push_str("mkdir -p $out/bin\n");
-            script.push_str(&format!("cp build/{} $out/bin/", self.pname));
+            // Skip entirely if binary exists (CA-derivation reuse)
+            script.push_str(&format!(
+                "[ -f \"$out/bin/{}\" ] || {{ mkdir -p $out/bin && cp build/{} $out/bin/; }}",
+                self.pname, self.pname
+            ));
         } else {
             // For libraries and proc-macros, copy all outputs from --out-dir
             // This includes .rlib, .rmeta, .d files
-            script.push_str("mkdir -p $out/lib\n");
-            script.push_str("cp build/* $out/lib/");
+            // Skip entirely if $out/lib exists (CA-derivation reuse)
+            script
+                .push_str("[ -d \"$out/lib\" ] || { mkdir -p $out/lib && cp build/* $out/lib/; }");
         }
 
         script
@@ -602,7 +608,7 @@ impl UnitDerivation {
 }
 
 /// Configuration for the Nix code generator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NixGenConfig {
     /// The workspace root path (for source remapping).
     pub workspace_root: String,
@@ -619,18 +625,6 @@ pub struct NixGenConfig {
 
     /// The host platform triple (for proc-macros and build scripts).
     pub host_platform: Option<String>,
-}
-
-impl Default for NixGenConfig {
-    fn default() -> Self {
-        Self {
-            workspace_root: String::new(),
-            content_addressed: false,
-            cross_compiling: false,
-            target_platform: None,
-            host_platform: None,
-        }
-    }
 }
 
 impl NixGenConfig {
@@ -916,16 +910,16 @@ impl NixGenerator {
         out.push_str("\n  # Binary targets only\n");
         out.push_str("  binaries = {\n");
         for &root_idx in &graph.roots {
-            if let Some(unit) = graph.units.get(root_idx) {
-                if unit.is_bin() {
-                    let target_name = &unit.target.name;
-                    let drv_name = unit.derivation_name();
-                    out.push_str(&format!(
-                        "    \"{}\" = units.\"{}\";\n",
-                        escape_nix_string(target_name),
-                        drv_name
-                    ));
-                }
+            if let Some(unit) = graph.units.get(root_idx)
+                && unit.is_bin()
+            {
+                let target_name = &unit.target.name;
+                let drv_name = unit.derivation_name();
+                out.push_str(&format!(
+                    "    \"{}\" = units.\"{}\";\n",
+                    escape_nix_string(target_name),
+                    drv_name
+                ));
             }
         }
         out.push_str("  };\n");
@@ -934,28 +928,28 @@ impl NixGenerator {
         out.push_str("\n  # Library targets only\n");
         out.push_str("  libraries = {\n");
         for &root_idx in &graph.roots {
-            if let Some(unit) = graph.units.get(root_idx) {
-                if unit.is_lib() || unit.is_proc_macro() {
-                    let target_name = &unit.target.name;
-                    let drv_name = unit.derivation_name();
-                    out.push_str(&format!(
-                        "    \"{}\" = units.\"{}\";\n",
-                        escape_nix_string(target_name),
-                        drv_name
-                    ));
-                }
+            if let Some(unit) = graph.units.get(root_idx)
+                && (unit.is_lib() || unit.is_proc_macro())
+            {
+                let target_name = &unit.target.name;
+                let drv_name = unit.derivation_name();
+                out.push_str(&format!(
+                    "    \"{}\" = units.\"{}\";\n",
+                    escape_nix_string(target_name),
+                    drv_name
+                ));
             }
         }
         out.push_str("  };\n");
 
         // Convenience: default is the first root
-        if let Some(&first_root) = graph.roots.first() {
-            if let Some(unit) = graph.units.get(first_root) {
-                out.push_str(&format!(
-                    "\n  default = units.\"{}\";\n",
-                    unit.derivation_name()
-                ));
-            }
+        if let Some(&first_root) = graph.roots.first()
+            && let Some(unit) = graph.units.get(first_root)
+        {
+            out.push_str(&format!(
+                "\n  default = units.\"{}\";\n",
+                unit.derivation_name()
+            ));
         }
 
         out.push_str("}\n");
