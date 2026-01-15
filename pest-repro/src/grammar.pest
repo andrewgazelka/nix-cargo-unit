@@ -1,0 +1,3 @@
+// Simple test grammar
+ident = { ASCII_ALPHA+ }
+number = { ASCII_DIGIT+ }

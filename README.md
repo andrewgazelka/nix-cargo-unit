@@ -49,35 +49,40 @@ CA derivations fail on macOS due to code signing ([NixOS/nix#6065](https://githu
 ## How it works
 
 ```mermaid
-flowchart LR
-    subgraph Input
-        src[Cargo workspace]
+flowchart TB
+    subgraph Rust["Rust Toolchain"]
+        cargo["cargo --unit-graph"]
     end
 
-    subgraph Analysis
-        src --> unitgraph[cargo build --unit-graph]
-        unitgraph --> dag[Unit DAG]
+    subgraph Nix["Nix"]
+        direction TB
+        gen[Generate derivations]
+
+        subgraph Units["Per-Unit Derivations"]
+            direction LR
+            build["build.rs"]
+            proc["proc-macro"]
+            lib["lib/bin"]
+        end
+
+        subgraph Store["Nix Store (CA)"]
+            cache["Content-addressed cache"]
+        end
     end
 
-    subgraph "Nix Derivations"
-        dag --> gen[Generate per-unit derivations]
-        gen --> build["build.rs units"]
-        gen --> proc["proc-macro units"]
-        gen --> lib["lib/bin units"]
-
-        build -->|cargo:rustc-cfg| lib
-        proc -->|--extern| lib
-    end
-
-    subgraph Output
-        lib --> bins[Final binaries]
-    end
+    src[Cargo workspace] --> cargo
+    cargo -->|"JSON DAG"| gen
+    gen --> Units
+    build -->|rustc-cfg| lib
+    proc -->|--extern| lib
+    Units <-->|"hash-based dedup"| cache
+    lib --> out[Final binaries]
 ```
 
-1. **Analysis**: Runs `cargo build --unit-graph` to extract the compilation DAG
-2. **Generation**: Creates a Nix derivation per unit with `--extern` and `-L` flags
-3. **Wiring**: Build script outputs (`cargo:rustc-cfg`, etc.) flow to dependent units
-4. **Host compilation**: Proc-macros compile for host platform, libraries for target
+1. **Analysis**: Cargo extracts the unit dependency graph as JSON
+2. **Generation**: Nix creates one derivation per compilation unit
+3. **Wiring**: Build script outputs and proc-macros flow to dependents
+4. **Caching**: Content-addressed store deduplicates identical units across builds
 
 ## Example
 
