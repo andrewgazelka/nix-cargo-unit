@@ -357,8 +357,9 @@ pub fn remap_manifest_dir(
     let source_loc = SourceLocation::from_unit(unit);
 
     match source_loc {
-        Some(loc) if loc.is_registry() => {
-            // Registry crates: ${vendorDir}/cratename-version
+        Some(loc) if loc.is_registry() || loc.is_git() => {
+            // Registry and git crates: ${vendorDir}/cratename-version
+            // Both are vendored by cargo with the same naming scheme
             format!("${{{}}}/{}-{}", nix_vendor_var, loc.name, loc.version)
         }
         Some(loc) if loc.is_path() => {

@@ -828,7 +828,10 @@ impl NixGenerator {
                 for dep in &lib_unit.dependencies {
                     if let Some(dep_unit) = graph.units.get(dep.index) {
                         // If this dependency is a build script RUN, add it
-                        if dep_unit.mode == "run-custom-build" {
+                        // Skip the current package's own build script to avoid self-reference
+                        if dep_unit.mode == "run-custom-build"
+                            && dep_unit.package_name() != bs_run.package_name
+                        {
                             if let Some(other_bs_run_idx) =
                                 package_to_bs_run.get(dep_unit.package_name())
                             {
@@ -839,12 +842,15 @@ impl NixGenerator {
                         }
                         // Also check if the dependency's package has a build script
                         // (in case it's a lib unit that depends on another lib)
+                        // Skip the current package's own build script to avoid self-reference
                         let dep_pkg_name = dep_unit.package_name();
-                        if let Some(other_bs_run_idx) = package_to_bs_run.get(dep_pkg_name) {
-                            let other_bs = &build_script_runs[*other_bs_run_idx];
-                            let run_var = format!("units.\"{}\"", other_bs.info.run_drv_name);
-                            if !dep_bs_outputs.contains(&run_var) {
-                                dep_bs_outputs.push(run_var);
+                        if dep_pkg_name != bs_run.package_name {
+                            if let Some(other_bs_run_idx) = package_to_bs_run.get(dep_pkg_name) {
+                                let other_bs = &build_script_runs[*other_bs_run_idx];
+                                let run_var = format!("units.\"{}\"", other_bs.info.run_drv_name);
+                                if !dep_bs_outputs.contains(&run_var) {
+                                    dep_bs_outputs.push(run_var);
+                                }
                             }
                         }
                     }
