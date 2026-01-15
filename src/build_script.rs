@@ -454,12 +454,14 @@ impl BuildScriptInfo {
 
         // Extract 'links' field from Cargo.toml for DEP_* variable passing
         // This is used by dependent build scripts to receive cargo metadata
+        // Also set CARGO_MANIFEST_LINKS which build scripts like ring check for
         script.push_str(&format!(
             r#"
 # Extract links field from Cargo.toml (for DEP_* variable passing)
 LINKS_VALUE=$(sed -n 's/^links[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "{0}/Cargo.toml" | head -1)
 if [ -n "$LINKS_VALUE" ]; then
   echo "$LINKS_VALUE" > $out/links
+  export CARGO_MANIFEST_LINKS="$LINKS_VALUE"
 fi
 "#,
             self.manifest_dir
