@@ -416,9 +416,27 @@ impl Unit {
     }
 
     /// Extracts the package name from pkg_id.
-    /// Format (new): "path+file:///...#name@version" -> "name"
-    /// Format (old): "name version (source)" -> "name"
+    ///
+    /// Formats supported:
+    /// - Path/registry: "path+file:///...#name@version" or "registry+...#name@version" -> "name"
+    /// - Git: "git+https://github.com/user/repo#version" -> "repo"
+    /// - Old format: "name version (source)" -> "name"
     pub fn package_name(&self) -> &str {
+        // Handle git dependencies: "git+<url>#version"
+        // The package name is the last segment of the URL path
+        if self.pkg_id.starts_with("git+") {
+            // Find the URL (between "git+" and "#")
+            if let Some(hash_pos) = self.pkg_id.find('#') {
+                let url = &self.pkg_id[4..hash_pos]; // Skip "git+"
+                // Extract last path segment (the repo name)
+                if let Some(last_slash) = url.rfind('/') {
+                    let name = &url[last_slash + 1..];
+                    // Strip .git suffix if present
+                    return name.strip_suffix(".git").unwrap_or(name);
+                }
+            }
+        }
+
         // Handle new Cargo format: "path+file:///...#name@version" or "registry+...#name@version"
         if let Some(hash_pos) = self.pkg_id.find('#') {
             let after_hash = &self.pkg_id[hash_pos + 1..];
@@ -437,9 +455,20 @@ impl Unit {
     }
 
     /// Extracts the package version from pkg_id.
-    /// Format (new): "path+file:///...#name@version" -> "version"
-    /// Format (old): "name version (source)" -> "version"
+    ///
+    /// Formats supported:
+    /// - Path/registry: "path+file:///...#name@version" -> "version"
+    /// - Git: "git+https://github.com/user/repo#version" -> "version"
+    /// - Old format: "name version (source)" -> "version"
     pub fn package_version(&self) -> Option<&str> {
+        // Handle git dependencies: "git+<url>#version"
+        if self.pkg_id.starts_with("git+") {
+            if let Some(hash_pos) = self.pkg_id.find('#') {
+                return Some(&self.pkg_id[hash_pos + 1..]);
+            }
+            return None;
+        }
+
         // Handle new Cargo format: "path+file:///...#name@version"
         if let Some(hash_pos) = self.pkg_id.find('#') {
             let after_hash = &self.pkg_id[hash_pos + 1..];
@@ -982,5 +1011,51 @@ mod tests {
         let name = unit.derivation_name();
         assert!(name.starts_with("serde-1.0.219-"));
         assert_eq!(name.len(), "serde-1.0.219-".len() + 16); // 16 hex chars
+    }
+
+    #[test]
+    fn test_git_dependency_package_name() {
+        // Test git dependency pkg_id format: "git+<url>#version"
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "git+https://github.com/user/human-id#0.1.0",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "human_id", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph: UnitGraph = serde_json::from_str(json).expect("failed to parse");
+        let unit = &graph.units[0];
+
+        assert_eq!(unit.package_name(), "human-id");
+        assert_eq!(unit.package_version(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn test_git_dependency_with_git_suffix() {
+        // Test git dependency with .git suffix in URL
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "git+https://github.com/user/my-crate.git#1.2.3",
+                "target": {"kind": ["lib"], "crate_types": ["lib"], "name": "my_crate", "src_path": "/test/src/lib.rs", "edition": "2021"},
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph: UnitGraph = serde_json::from_str(json).expect("failed to parse");
+        let unit = &graph.units[0];
+
+        assert_eq!(unit.package_name(), "my-crate");
+        assert_eq!(unit.package_version(), Some("1.2.3"));
     }
 }
