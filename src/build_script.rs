@@ -15,10 +15,6 @@
 //! The run derivation outputs structured files that [`BuildScriptOutput`] can parse
 //! to generate the appropriate rustc flags.
 
-use crate::nix_gen::{NixAttrSet, generate_cargo_pkg_exports};
-use crate::rustc_flags::RustcFlags;
-use crate::unit_graph::Unit;
-
 /// Parsed output from a build script execution.
 ///
 /// This represents the structured output from a build script run derivation.
@@ -261,7 +257,7 @@ pub struct BuildScriptInfo {
     pub run_drv_name: String,
 
     /// Rustc flags for compiling the build script.
-    pub rustc_flags: RustcFlags,
+    pub rustc_flags: crate::rustc_flags::RustcFlags,
 
     /// Features enabled for this build script.
     pub features: Vec<String>,
@@ -274,7 +270,12 @@ impl BuildScriptInfo {
     /// Extracts build script information from a unit.
     ///
     /// Returns `None` if the unit is not a build script.
-    pub fn from_unit(unit: &Unit, workspace_root: &str, content_addressed: bool) -> Option<Self> {
+    #[must_use]
+    pub fn from_unit(
+        unit: &crate::unit_graph::Unit,
+        workspace_root: &str,
+        content_addressed: bool,
+    ) -> Option<Self> {
         if !unit.is_build_script() {
             return None;
         }
@@ -296,7 +297,7 @@ impl BuildScriptInfo {
         let compile_drv_name = format!("{package_name}-build-script-{version}-{base_hash}");
         let run_drv_name = format!("{package_name}-build-script-run-{version}-{base_hash}");
 
-        let rustc_flags = RustcFlags::from_unit(unit);
+        let rustc_flags = crate::rustc_flags::RustcFlags::from_unit(unit);
 
         Some(Self {
             package_name,
@@ -316,7 +317,7 @@ impl BuildScriptInfo {
     ///
     /// This produces a binary that can be executed.
     pub fn compile_derivation(&self) -> String {
-        let mut attrs = NixAttrSet::new();
+        let mut attrs = crate::nix_gen::NixAttrSet::new();
 
         attrs.string("pname", &format!("{}-build-script", self.package_name));
         attrs.string("version", &self.version);
@@ -353,7 +354,7 @@ impl BuildScriptInfo {
         script.push_str("mkdir -p build\n\n");
 
         // Set Cargo environment variables that build scripts may use via env!() at compile time
-        script.push_str(&generate_cargo_pkg_exports(
+        script.push_str(&crate::nix_gen::generate_cargo_pkg_exports(
             &self.package_name,
             &self.version,
             &self.features,
@@ -397,7 +398,7 @@ impl BuildScriptInfo {
         compile_drv_var: &str,
         dep_build_script_outputs: &[String],
     ) -> String {
-        let mut attrs = NixAttrSet::new();
+        let mut attrs = crate::nix_gen::NixAttrSet::new();
 
         attrs.string(
             "pname",
@@ -504,7 +505,7 @@ fi
         }
 
         // Set Cargo package environment variables
-        script.push_str(&generate_cargo_pkg_exports(
+        script.push_str(&crate::nix_gen::generate_cargo_pkg_exports(
             &self.package_name,
             &self.version,
             &self.features,
@@ -672,17 +673,17 @@ rm -f "$BUILD_SCRIPT_OUTPUT"
 }
 
 /// Checks if a unit is a build script that needs special handling.
-pub fn is_build_script_unit(unit: &Unit) -> bool {
+pub fn is_build_script_unit(unit: &crate::unit_graph::Unit) -> bool {
     unit.is_build_script()
 }
 
 /// Checks if a unit's mode is "run-custom-build" (build script execution).
-pub fn is_build_script_run(unit: &Unit) -> bool {
+pub fn is_build_script_run(unit: &crate::unit_graph::Unit) -> bool {
     unit.mode == "run-custom-build"
 }
 
 /// Checks if a unit's target kind is "custom-build" (build script compilation).
-pub fn is_build_script_compile(unit: &Unit) -> bool {
+pub fn is_build_script_compile(unit: &crate::unit_graph::Unit) -> bool {
     unit.target.kind.contains(&"custom-build".to_string())
 }
 

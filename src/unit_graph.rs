@@ -500,6 +500,7 @@ impl Unit {
     /// multiple times with different features or profiles.
     ///
     /// Returns a 16-character hex string (first 64 bits of SHA-256).
+    #[must_use]
     pub fn identity_hash(&self) -> String {
         use sha2::Digest as _;
 
@@ -591,6 +592,7 @@ impl Unit {
     ///
     /// Format: `{crate_name}-{version}-{identity_hash}`
     /// Example: `serde-1.0.219-a1b2c3d4e5f67890`
+    #[must_use]
     pub fn derivation_name(&self) -> String {
         let name = &self.target.name;
         let version = self.package_version().unwrap_or("0.0.0");

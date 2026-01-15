@@ -17,7 +17,6 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
-      rustToolchain = pkgs.rust-bin.stable.latest.default;
     in {
       default = pkgs.rustPlatform.buildRustPackage {
         pname = "nix-cargo-unit";

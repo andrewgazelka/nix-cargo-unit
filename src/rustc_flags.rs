@@ -4,10 +4,6 @@
 //! the unit metadata from cargo's unit graph. The goal is to reproduce exactly
 //! what cargo would pass to rustc.
 
-use crate::unit_graph::{
-    DebugInfo, LtoSetting, PanicStrategy, Profile, StripSetting, Target, Unit,
-};
-
 /// A builder for rustc command-line arguments.
 ///
 /// This struct accumulates flags and can produce either a `Vec<String>` of arguments
@@ -30,7 +26,8 @@ impl RustcFlags {
     ///
     /// Note: `--extern` and `-L` flags for dependencies are NOT included here;
     /// those must be added separately based on the resolved dependency graph.
-    pub fn from_unit(unit: &Unit) -> Self {
+    #[must_use]
+    pub fn from_unit(unit: &crate::unit_graph::Unit) -> Self {
         let mut flags = Self::new();
 
         // Crate name - normalize hyphens to underscores as required by rustc
@@ -66,13 +63,13 @@ impl RustcFlags {
     }
 
     /// Adds the edition flag.
-    fn add_edition(&mut self, target: &Target) {
+    fn add_edition(&mut self, target: &crate::unit_graph::Target) {
         self.push_arg("--edition");
         self.push_arg(&target.edition);
     }
 
     /// Adds crate type flags.
-    fn add_crate_types(&mut self, target: &Target) {
+    fn add_crate_types(&mut self, target: &crate::unit_graph::Target) {
         for crate_type in &target.crate_types {
             self.push_arg("--crate-type");
             self.push_arg(crate_type);
@@ -88,7 +85,11 @@ impl RustcFlags {
     }
 
     /// Adds all profile-related codegen flags.
-    fn add_profile_flags(&mut self, profile: &Profile, target: &Target) {
+    fn add_profile_flags(
+        &mut self,
+        profile: &crate::unit_graph::Profile,
+        target: &crate::unit_graph::Target,
+    ) {
         // Optimization level
         self.push_codegen_flag("opt-level", &profile.opt_level);
 
@@ -134,7 +135,8 @@ impl RustcFlags {
     }
 
     /// Adds debuginfo flag.
-    fn add_debuginfo(&mut self, debuginfo: DebugInfo) {
+    fn add_debuginfo(&mut self, debuginfo: crate::unit_graph::DebugInfo) {
+        use crate::unit_graph::DebugInfo;
         let value = match debuginfo {
             DebugInfo::None => "0",
             DebugInfo::LineDirectivesOnly => "line-directives-only",
@@ -146,7 +148,8 @@ impl RustcFlags {
     }
 
     /// Adds LTO flag.
-    fn add_lto(&mut self, lto: &LtoSetting) {
+    fn add_lto(&mut self, lto: &crate::unit_graph::LtoSetting) {
+        use crate::unit_graph::LtoSetting;
         let value = match lto {
             LtoSetting::Off => "off",
             LtoSetting::Thin => "thin",
@@ -156,7 +159,8 @@ impl RustcFlags {
     }
 
     /// Adds panic strategy flag.
-    fn add_panic(&mut self, panic: &PanicStrategy) {
+    fn add_panic(&mut self, panic: &crate::unit_graph::PanicStrategy) {
+        use crate::unit_graph::PanicStrategy;
         let value = match panic {
             PanicStrategy::Unwind => "unwind",
             PanicStrategy::Abort => "abort",
@@ -166,7 +170,8 @@ impl RustcFlags {
     }
 
     /// Adds strip flag.
-    fn add_strip(&mut self, strip: &StripSetting) {
+    fn add_strip(&mut self, strip: &crate::unit_graph::StripSetting) {
+        use crate::unit_graph::StripSetting;
         let value = match strip {
             StripSetting::None => "none",
             StripSetting::Debuginfo => "debuginfo",
