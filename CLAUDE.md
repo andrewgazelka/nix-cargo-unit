@@ -9,8 +9,9 @@ We have a custom Nix at `~/Projects/nix` that we control - keep modifying it unt
 **Ownership check failure (macOS multi-user)**: Outputs owned by one nixbld user but validated
 by another. Fix is in `src/libstore/unix/build/derivation-builder.cc`.
 
-**CA hash mismatch across Nix versions** (GitHub #9397): Different Nix versions compute different
-CA hashes due to self-hash rewriting changes in commit 3ebe134 (Nix 2.17.0+). Symptoms:
+**CA hash mismatch across Nix versions** ([NixOS/nix#9397](https://github.com/NixOS/nix/issues/9397)):
+Different Nix versions compute different CA hashes due to self-hash rewriting changes in commit
+3ebe134 (Nix 2.17.0+). Symptoms:
 - "ca hash mismatch importing path" errors
 - Cached outputs from older Nix versions incompatible with newer versions
 - Solution: Clean cache with `nix-collect-garbage -d` or use consistent Nix version
