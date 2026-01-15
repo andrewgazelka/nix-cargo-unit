@@ -262,11 +262,12 @@ let
         # Generate unit graph
         # --unit-graph requires -Z unstable-options (nightly)
         # We use --release by default for optimized builds
+        # --frozen prevents network access AND Cargo.lock updates (read-only in nix store)
         cargo build \
           --unit-graph \
           -Z unstable-options \
           ${lib.optionalString (profile == "release") "--release"} \
-          ${lib.optionalString (vendorDir != null) "--offline"} \
+          ${lib.optionalString (vendorDir != null) "--frozen"} \
           ${cargoArgs} \
           > $out
       '';

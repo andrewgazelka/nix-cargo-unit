@@ -389,6 +389,10 @@ pub struct UnitDerivation {
     /// Entry point source path (Nix expression).
     pub src_path: String,
 
+    /// Manifest directory path (Nix expression) - directory containing Cargo.toml.
+    /// Needed for proc-macros like pest_derive that read files relative to CARGO_MANIFEST_DIR.
+    pub manifest_dir: String,
+
     /// Features enabled.
     pub features: Vec<String>,
 
@@ -447,6 +451,10 @@ impl UnitDerivation {
         let src_path =
             crate::source_filter::remap_source_path(&unit.target.src_path, workspace_root, "src");
 
+        // Remap manifest directory (needed for CARGO_MANIFEST_DIR)
+        let manifest_dir =
+            crate::source_filter::remap_manifest_dir(unit, workspace_root, "src", "vendorDir");
+
         let mut rustc_flags = RustcFlags::from_unit(unit);
         // Add metadata hash for stable crate identity across compilations.
         // Skip proc-macros: rustc rejects proc-macro dylibs with a forced metadata hash.
@@ -467,6 +475,7 @@ impl UnitDerivation {
             edition: unit.target.edition.clone(),
             crate_types: unit.target.crate_types.clone(),
             src_path,
+            manifest_dir,
             features: unit.features.clone(),
             opt_level: unit.profile.opt_level.clone(),
             is_test: unit.is_test(),
@@ -559,6 +568,14 @@ impl UnitDerivation {
             &self.features,
         ));
         script.push('\n');
+
+        // Set CARGO_MANIFEST_DIR - required for proc-macros that read files relative to Cargo.toml
+        // (e.g., pest_derive with #[grammar = "grammar.pest"])
+        let _ = writeln!(
+            script,
+            "export CARGO_MANIFEST_DIR=\"{}\"",
+            self.manifest_dir
+        );
 
         // Read build script outputs if this unit depends on a build script
         if let Some(ref bs_ref) = self.build_script_ref {
@@ -1474,6 +1491,7 @@ mod tests {
             edition: "2024".to_string(),
             crate_types: vec!["lib".to_string()],
             src_path: "${src}/src/lib.rs".to_string(),
+            manifest_dir: "${src}".to_string(),
             features: vec![],
             opt_level: "0".to_string(),
             is_test: false,
@@ -1771,6 +1789,7 @@ mod tests {
             edition: "2024".to_string(),
             crate_types: vec!["lib".to_string()],
             src_path: "${src}/src/lib.rs".to_string(),
+            manifest_dir: "${src}".to_string(),
             features: vec![],
             opt_level: "0".to_string(),
             is_test: false,

@@ -11,4 +11,4 @@ one nixbld user but validated by another. Fix is in `src/libstore/unix/build/der
 Useful:
 - ~/Projects/rust
 - ~/Projects/cargo
-- ~/Projects/nix (custom nix with CA fixes)
+- ~/Projects/nix (custom nix with CA fixes; make your own fix if it is not right)
