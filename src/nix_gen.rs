@@ -572,6 +572,8 @@ impl UnitDerivation {
             }
         }
 
+        // Debug: enable command tracing to see the actual rustc command
+        script.push_str("set -x\n");
         script.push_str("rustc \\\n");
 
         // Add each flag on its own line for readability
