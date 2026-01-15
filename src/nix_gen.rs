@@ -559,6 +559,16 @@ impl UnitDerivation {
                 script.push('-');
                 script.push_str(&dep.identity_hash);
                 script.push_str(".so\"\n");
+                // Debug: print the variable value
+                script.push_str("echo \"DEBUG: ");
+                script.push_str(&var_name);
+                script.push_str(" = $");
+                script.push_str(&var_name);
+                script.push_str("\" && ls -la \"$");
+                script.push_str(&var_name);
+                script.push_str("\" || echo \"File not found: $");
+                script.push_str(&var_name);
+                script.push_str("\"\n");
             }
         }
 
