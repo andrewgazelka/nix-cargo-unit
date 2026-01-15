@@ -334,3 +334,42 @@ let config = NixGenConfig {
 
 ### UnitDerivation.from_unit signature
 `UnitDerivation::from_unit(unit, workspace_root, content_addressed)` now takes a third parameter to control CA attributes.
+
+## From feature #7
+
+### DepRef Struct
+`DepRef` tracks dependency information for Nix derivation wiring:
+```rust
+pub struct DepRef {
+    pub nix_var: String,           // e.g., "units.\"serde-1.0.0-abc123\""
+    pub extern_crate_name: String, // e.g., "serde"
+    pub derivation_name: String,   // e.g., "serde-1.0.0-abc123"
+    pub is_proc_macro: bool,       // whether this is a proc-macro dependency
+}
+```
+
+### Dependency Wiring in NixGenerator
+`NixGenerator::generate()` now wires up dependencies:
+- Pre-computes derivation names for all units
+- For each unit, creates `DepRef` for each dependency
+- `DepRef.nix_var` references the dependency derivation
+
+### Generated Build Phase with Dependencies
+Build phase now includes:
+1. `-L dependency=$dep/lib` for each dependency (library search path)
+2. `--extern name=$dep/lib/libname.rlib` for regular deps
+3. `--extern name="$(find $dep/lib -name 'libname.*' | head -1)"` for proc-macros
+
+### Crate Name Normalization
+Library file names normalize hyphens to underscores:
+- Crate `serde-derive` -> `libserde_derive.rlib`
+- Uses `name.replace('-', "_")` for the file name
+
+### Proc-Macro Handling
+Proc-macros are shared libraries (.so on Linux, .dylib on macOS).
+Use `find` to locate the correct file since extension varies by platform.
+
+### Output Directory Creation
+Build phase creates the correct output directory:
+- `mkdir -p $out/bin` for binaries
+- `mkdir -p $out/lib` for libraries/proc-macros

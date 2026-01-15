@@ -12,7 +12,7 @@ use crate::unit_graph::{
 ///
 /// This struct accumulates flags and can produce either a `Vec<String>` of arguments
 /// or a formatted string suitable for shell scripts.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RustcFlags {
     args: Vec<String>,
 }

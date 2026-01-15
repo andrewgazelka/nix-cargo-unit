@@ -68,7 +68,7 @@ fn escape_nix_string(s: &str) -> String {
 /// Multiline strings have different escape rules:
 /// - `''$` -> literal `$`
 /// - `'''` -> literal `''`
-fn escape_nix_multiline(s: &str) -> String {
+pub fn escape_nix_multiline(s: &str) -> String {
     s.replace("''", "'''").replace("${", "''${")
 }
 

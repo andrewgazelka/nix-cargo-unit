@@ -63,7 +63,7 @@ features:
     relevant_files:
       - "@src/nix_gen.rs"
       - "@src/rustc_flags.rs"
-    status: in_progress
+    status: done
     block_count: 0
 
   # Phase 2: Build Script Support
@@ -74,7 +74,7 @@ features:
       - "@src/build_script.rs"
       - "@src/nix_gen.rs"
       - "@src/lib.rs"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 9
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 6
+  done: 7
   blocked: 0
   total: 17
