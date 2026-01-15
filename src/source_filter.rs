@@ -171,7 +171,7 @@ impl SourceLocation {
 /// - `"my-crate 0.1.0 (path+file:///home/user/project)"`
 /// - `"path+file:///home/user/project#my-crate@0.1.0"`
 fn parse_pkg_id(pkg_id: &str) -> Option<(String, String, SourceType)> {
-    // Try new format first: "source#name@version"
+    // Try new format first: "source#name@version" or "git+url#version"
     if let Some(hash_pos) = pkg_id.find('#') {
         let source_str = &pkg_id[..hash_pos];
         let name_version = &pkg_id[hash_pos + 1..];
@@ -180,6 +180,22 @@ fn parse_pkg_id(pkg_id: &str) -> Option<(String, String, SourceType)> {
         if let Some(at_pos) = name_version.find('@') {
             let name = name_version[..at_pos].to_string();
             let version = name_version[at_pos + 1..].to_string();
+            let source = parse_source_type(source_str)?;
+            return Some((name, version, source));
+        }
+
+        // Git format: "git+url#version" - extract name from URL
+        if source_str.starts_with("git+") {
+            let version = name_version.to_string();
+            // Extract name from git URL (last path segment before any query/fragment)
+            let url_part = source_str.strip_prefix("git+").unwrap_or(source_str);
+            let url_without_query = url_part.split('?').next().unwrap_or(url_part);
+            let name = url_without_query
+                .rsplit('/')
+                .next()
+                .map(|s| s.strip_suffix(".git").unwrap_or(s))
+                .unwrap_or("unknown")
+                .to_string();
             let source = parse_source_type(source_str)?;
             return Some((name, version, source));
         }

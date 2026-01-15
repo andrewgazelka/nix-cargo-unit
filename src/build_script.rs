@@ -167,19 +167,25 @@ impl BuildScriptOutput {
 
     /// Generates Nix code to read build script outputs and construct rustc flags.
     ///
-    /// Generates shell snippet to read a build script output file and append flags.
-    fn flag_reader_snippet(var: &str, filename: &str, flag_format: &str) -> String {
-        format!(
-            r#"if [ -f {var}/{filename} ]; then
-  while IFS= read -r line; do
-    [ -n "$line" ] && BUILD_SCRIPT_FLAGS="$BUILD_SCRIPT_FLAGS {flag_format}"
-  done < {var}/{filename}
-fi
-"#,
-            var = var,
-            filename = filename,
-            flag_format = flag_format
-        )
+    /// Appends shell snippet to read a build script output file and append flags.
+    #[inline]
+    fn append_flag_reader_snippet(
+        script: &mut String,
+        var: &str,
+        filename: &str,
+        flag_format: &str,
+    ) {
+        script.push_str("if [ -f ");
+        script.push_str(var);
+        script.push('/');
+        script.push_str(filename);
+        script.push_str(" ]; then\n  while IFS= read -r line; do\n    [ -n \"$line\" ] && BUILD_SCRIPT_FLAGS=\"$BUILD_SCRIPT_FLAGS ");
+        script.push_str(flag_format);
+        script.push_str("\"\n  done < ");
+        script.push_str(var);
+        script.push('/');
+        script.push_str(filename);
+        script.push_str("\nfi\n");
     }
 
     /// This generates shell script code that reads from the build script output
@@ -189,32 +195,24 @@ fi
     /// (e.g., `"$buildScriptOutput"`).
     pub fn generate_nix_flag_reader(build_script_output_var: &str) -> String {
         let var = build_script_output_var;
-        let mut script = String::from("# Read build script outputs\n");
+        // Pre-allocate: ~700 bytes typical
+        let mut script = String::with_capacity(700);
+        script.push_str("# Read build script outputs\n");
 
-        script.push_str(&Self::flag_reader_snippet(var, "rustc-cfg", "--cfg $line"));
-        script.push_str(&Self::flag_reader_snippet(
-            var,
-            "rustc-link-lib",
-            "-l $line",
-        ));
-        script.push_str(&Self::flag_reader_snippet(
-            var,
-            "rustc-link-search",
-            "-L $line",
-        ));
-        script.push_str(&Self::flag_reader_snippet(
+        Self::append_flag_reader_snippet(&mut script, var, "rustc-cfg", "--cfg $line");
+        Self::append_flag_reader_snippet(&mut script, var, "rustc-link-lib", "-l $line");
+        Self::append_flag_reader_snippet(&mut script, var, "rustc-link-search", "-L $line");
+        Self::append_flag_reader_snippet(
+            &mut script,
             var,
             "rustc-cdylib-link-arg",
             "-C link-arg=$line",
-        ));
+        );
 
         // Export OUT_DIR for generated files
-        script.push_str(&format!(
-            r#"# Set OUT_DIR for generated code
-export OUT_DIR={var}/out-dir
-"#,
-            var = var
-        ));
+        script.push_str("# Set OUT_DIR for generated code\nexport OUT_DIR=");
+        script.push_str(var);
+        script.push_str("/out-dir\n");
 
         script
     }

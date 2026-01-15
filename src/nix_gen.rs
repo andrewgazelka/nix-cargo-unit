@@ -4,6 +4,9 @@
 //! from cargo unit graph data. It focuses on proper escaping, composability,
 //! and producing readable output.
 
+use std::fmt::Write as _;
+use std::rc::Rc;
+
 use crate::build_script::{BuildScriptInfo, BuildScriptOutput};
 
 /// Parsed version components from a semver string.
@@ -39,24 +42,16 @@ pub fn generate_cargo_pkg_exports(
     version: &str,
     features: &[String],
 ) -> String {
-    let mut script = String::new();
+    // Pre-allocate: ~500 bytes base + ~40 bytes per feature
+    let mut script = String::with_capacity(500 + features.len() * 40);
     let vp = VersionParts::parse(version);
 
     script.push_str("# Cargo package environment variables for env!() macros\n");
-    script.push_str(&format!("export CARGO_PKG_NAME=\"{}\"\n", package_name));
-    script.push_str(&format!("export CARGO_PKG_VERSION=\"{}\"\n", version));
-    script.push_str(&format!(
-        "export CARGO_PKG_VERSION_MAJOR=\"{}\"\n",
-        vp.major
-    ));
-    script.push_str(&format!(
-        "export CARGO_PKG_VERSION_MINOR=\"{}\"\n",
-        vp.minor
-    ));
-    script.push_str(&format!(
-        "export CARGO_PKG_VERSION_PATCH=\"{}\"\n",
-        vp.patch
-    ));
+    let _ = writeln!(script, "export CARGO_PKG_NAME=\"{package_name}\"");
+    let _ = writeln!(script, "export CARGO_PKG_VERSION=\"{version}\"");
+    let _ = writeln!(script, "export CARGO_PKG_VERSION_MAJOR=\"{}\"", vp.major);
+    let _ = writeln!(script, "export CARGO_PKG_VERSION_MINOR=\"{}\"", vp.minor);
+    let _ = writeln!(script, "export CARGO_PKG_VERSION_PATCH=\"{}\"", vp.patch);
     script.push_str("export CARGO_PKG_VERSION_PRE=\"\"\n");
     script.push_str("export CARGO_PKG_AUTHORS=\"\"\n");
     script.push_str("export CARGO_PKG_DESCRIPTION=\"\"\n");
@@ -69,8 +64,15 @@ pub fn generate_cargo_pkg_exports(
 
     // Set feature flags as environment variables
     for feature in features {
-        let env_name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
-        script.push_str(&format!("export {env_name}=1\n"));
+        script.push_str("export CARGO_FEATURE_");
+        for c in feature.chars() {
+            if c == '-' {
+                script.push('_');
+            } else {
+                script.push(c.to_ascii_uppercase());
+            }
+        }
+        script.push_str("=1\n");
     }
 
     script
@@ -197,19 +199,35 @@ impl NixAttrSet {
 
     /// Adds a list of strings.
     pub fn string_list(&mut self, key: &str, values: &[String]) -> &mut Self {
-        let items: Vec<String> = values
-            .iter()
-            .map(|v| format!("\"{}\"", escape_nix_string(v)))
-            .collect();
-        self.attrs
-            .push((key.to_string(), format!("[ {} ]", items.join(" "))));
+        // Build directly without intermediate Vec
+        let mut result = String::with_capacity(values.len() * 20 + 4);
+        result.push_str("[ ");
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                result.push(' ');
+            }
+            result.push('"');
+            result.push_str(&escape_nix_string(v));
+            result.push('"');
+        }
+        result.push_str(" ]");
+        self.attrs.push((key.to_owned(), result));
         self
     }
 
     /// Adds a list of raw expressions.
     pub fn expr_list(&mut self, key: &str, values: &[String]) -> &mut Self {
-        self.attrs
-            .push((key.to_string(), format!("[ {} ]", values.join(" "))));
+        let mut result =
+            String::with_capacity(values.iter().map(|s| s.len() + 1).sum::<usize>() + 4);
+        result.push_str("[ ");
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                result.push(' ');
+            }
+            result.push_str(v);
+        }
+        result.push_str(" ]");
+        self.attrs.push((key.to_owned(), result));
         self
     }
 
@@ -240,17 +258,19 @@ impl NixAttrSet {
         let base_indent = "  ".repeat(indent);
         let inner_indent = "  ".repeat(indent + 1);
 
-        let mut out = String::new();
+        // Pre-allocate based on content size
+        let estimated_size: usize = self.attrs.iter().map(|(k, v)| k.len() + v.len() + 10).sum();
+        let mut out = String::with_capacity(estimated_size + 64);
         out.push_str("{\n");
 
         for (key, value) in &self.attrs {
             // Handle multiline values specially
             if value.starts_with("''") && value.contains('\n') {
-                let lines: Vec<&str> = value.lines().collect();
                 out.push_str(&inner_indent);
                 out.push_str(key);
                 out.push_str(" = ");
-                for (i, line) in lines.iter().enumerate() {
+                // Iterate lines directly without collecting
+                for (i, line) in value.lines().enumerate() {
                     if i > 0 {
                         out.push('\n');
                         out.push_str(&inner_indent);
@@ -372,13 +392,15 @@ impl UnitDerivation {
     /// The `workspace_root` is used to remap absolute paths to Nix source paths.
     /// The `content_addressed` flag enables CA-derivation attributes.
     /// The `toolchain_var` specifies which toolchain to use (for cross-compilation).
+    /// The `drv_name` and `identity_hash` should be pre-computed for efficiency.
     pub fn from_unit(
         unit: &Unit,
         workspace_root: &str,
         content_addressed: bool,
         toolchain_var: &str,
+        drv_name: &str,
+        identity_hash: &str,
     ) -> Self {
-        let name = unit.derivation_name();
         let pname = unit.target.name.clone();
         let version = unit.package_version().unwrap_or("0.0.0").to_string();
 
@@ -388,10 +410,10 @@ impl UnitDerivation {
 
         let mut rustc_flags = RustcFlags::from_unit(unit);
         // Add metadata hash for stable crate identity across compilations
-        rustc_flags.add_metadata(&unit.identity_hash());
+        rustc_flags.add_metadata(identity_hash);
 
         Self {
-            name,
+            name: drv_name.to_owned(),
             pname,
             version,
             edition: unit.target.edition.clone(),
@@ -406,7 +428,7 @@ impl UnitDerivation {
             build_script_ref: None,
             rustc_flags,
             content_addressed,
-            toolchain_var: toolchain_var.to_string(),
+            toolchain_var: toolchain_var.to_owned(),
         }
     }
 
@@ -471,7 +493,9 @@ impl UnitDerivation {
 
     /// Generates the build phase script.
     fn generate_build_phase(&self) -> String {
-        let mut script = String::new();
+        // Pre-allocate: ~1KB base + ~100 bytes per dep
+        let mut script =
+            String::with_capacity(1024 + (self.deps.len() + self.lib_search_deps.len()) * 100);
 
         // Create build directory (NOT $out - $out is read-only during buildPhase in Nix sandbox)
         // We'll copy outputs to $out in installPhase
@@ -491,8 +515,11 @@ impl UnitDerivation {
         // Read build script outputs if this unit depends on a build script
         if let Some(ref bs_ref) = self.build_script_ref {
             script.push('\n');
-            // Wrap in ${...} for Nix interpolation in multiline strings
-            let shell_var = format!("${{{}}}", bs_ref.run_drv_var);
+            // Build shell_var directly without format!: "${units.\"name\"}"
+            let mut shell_var = String::with_capacity(bs_ref.run_drv_var.len() + 3);
+            shell_var.push_str("${");
+            shell_var.push_str(&bs_ref.run_drv_var);
+            shell_var.push('}');
             script.push_str(&BuildScriptOutput::generate_nix_flag_reader(&shell_var));
             script.push('\n');
         }
@@ -509,20 +536,18 @@ impl UnitDerivation {
         // Add -L library search paths for ALL dependencies (direct and transitive).
         // This is required because when rustc loads a dependency's rlib (e.g., http),
         // it needs to resolve THAT crate's dependencies (e.g., bytes) via -L search paths.
-        // Even if bytes is also a direct dep with --extern, we still need -L for rustc
-        // to find it when loading http's metadata.
         //
-        // Add -L for direct deps first
+        // Add -L for direct deps first (avoid format! - write directly)
         for dep in &self.deps {
-            script.push_str("  -L ");
-            script.push_str(&format!("dependency=${{{}}}/lib", dep.nix_var));
-            script.push_str(" \\\n");
+            script.push_str("  -L dependency=${");
+            script.push_str(&dep.nix_var);
+            script.push_str("}/lib \\\n");
         }
         // Add -L for transitive deps (lib_search_deps)
         for (lib_dep, _lib_name) in &self.lib_search_deps {
-            script.push_str("  -L ");
-            script.push_str(&format!("dependency=${{{}}}/lib", lib_dep));
-            script.push_str(" \\\n");
+            script.push_str("  -L dependency=${");
+            script.push_str(lib_dep);
+            script.push_str("}/lib \\\n");
         }
 
         // Proc-macro crates need --extern proc_macro (compiler-provided crate)
@@ -535,30 +560,32 @@ impl UnitDerivation {
         // lib_name is the actual library filename on disk (used in path to .rlib)
         for dep in &self.deps {
             script.push_str("  --extern ");
-            // Determine the library file name based on whether it's a proc-macro
-            // Wrap nix_var in ${...} for Nix interpolation
-            let lib_file = if dep.is_proc_macro {
+            if dep.is_proc_macro {
                 // Proc-macros are shared libraries (.so on Linux, .dylib on macOS)
                 // The filename includes the identity hash: lib{name}-{hash}.so/dylib
-                format!(
-                    "{}=\"$(find ${{{}}}/lib -type f \\( -name 'lib{}-{}.so' -o -name 'lib{}-{}.dylib' \\) | head -1)\"",
-                    dep.extern_crate_name,
-                    dep.nix_var,
-                    dep.lib_name,
-                    dep.identity_hash,
-                    dep.lib_name,
-                    dep.identity_hash
-                )
+                script.push_str(&dep.extern_crate_name);
+                script.push_str("=\"$(find ${");
+                script.push_str(&dep.nix_var);
+                script.push_str("}/lib -type f \\( -name 'lib");
+                script.push_str(&dep.lib_name);
+                script.push('-');
+                script.push_str(&dep.identity_hash);
+                script.push_str(".so' -o -name 'lib");
+                script.push_str(&dep.lib_name);
+                script.push('-');
+                script.push_str(&dep.identity_hash);
+                script.push_str(".dylib' \\) | head -1)\"");
             } else {
                 // Regular dependencies use .rlib
-                // Use lib_name (actual crate name) for the file path, extern_crate_name (alias) for --extern
-                // The filename includes the identity hash: lib{name}-{hash}.rlib
-                format!(
-                    "{}=${{{}}}/lib/lib{}-{}.rlib",
-                    dep.extern_crate_name, dep.nix_var, dep.lib_name, dep.identity_hash
-                )
-            };
-            script.push_str(&lib_file);
+                script.push_str(&dep.extern_crate_name);
+                script.push_str("=${");
+                script.push_str(&dep.nix_var);
+                script.push_str("}/lib/lib");
+                script.push_str(&dep.lib_name);
+                script.push('-');
+                script.push_str(&dep.identity_hash);
+                script.push_str(".rlib");
+            }
             script.push_str(" \\\n");
         }
 
@@ -568,15 +595,13 @@ impl UnitDerivation {
         script.push_str(" \\\n");
 
         // Add output options
-        if self.crate_types.contains(&"bin".to_string()) {
+        if self.crate_types.iter().any(|t| t == "bin") {
             // Binaries use -o for direct output
             script.push_str("  -o build/");
             script.push_str(&self.pname);
             script.push_str(" \\\n");
         } else {
             // Libraries use --out-dir to produce output files
-            // Use --emit=link only (not metadata) so metadata is embedded in .rlib
-            // This matches cargo's default behavior
             script.push_str("  --out-dir build \\\n");
             script.push_str("  --emit=dep-info,link \\\n");
         }
@@ -589,18 +614,17 @@ impl UnitDerivation {
 
     /// Generates the install phase script.
     fn generate_install_phase(&self) -> String {
-        let mut script = String::new();
+        let mut script = String::with_capacity(200);
 
-        if self.crate_types.contains(&"bin".to_string()) {
+        if self.crate_types.iter().any(|t| t == "bin") {
             // Skip entirely if binary exists (CA-derivation reuse)
-            script.push_str(&format!(
-                r#"[ -f "$out/bin/{0}" ] || {{
-  mkdir -p $out/bin
-  cp build/{0} $out/bin/
-  chmod 755 $out/bin/{0}
-}}"#,
-                self.pname
-            ));
+            script.push_str("[ -f \"$out/bin/");
+            script.push_str(&self.pname);
+            script.push_str("\" ] || {\n  mkdir -p $out/bin\n  cp build/");
+            script.push_str(&self.pname);
+            script.push_str(" $out/bin/\n  chmod 755 $out/bin/");
+            script.push_str(&self.pname);
+            script.push_str("\n}");
         } else {
             // For libraries and proc-macros, copy all outputs from --out-dir
             // This includes .rlib, .rmeta, .d files
@@ -694,13 +718,25 @@ impl NixGenerator {
         out.push_str("    dontConfigure = true;\n");
         out.push_str("  });\n\n");
 
-        // Pre-compute derivation names for all units (needed for dependency resolution)
-        let drv_names: Vec<String> = graph.units.iter().map(|u| u.derivation_name()).collect();
+        // Pre-compute identity hashes and derivation names for all units (needed for dependency resolution)
+        // Computing these upfront avoids redundant SHA-256 computations
+        let identity_hashes: Vec<String> = graph.units.iter().map(|u| u.identity_hash()).collect();
+        let drv_names: Vec<String> = graph
+            .units
+            .iter()
+            .zip(&identity_hashes)
+            .map(|(u, hash)| {
+                let name = &u.target.name;
+                let version = u.package_version().unwrap_or("0.0.0");
+                format!("{name}-{version}-{hash}")
+            })
+            .collect();
 
         // Compute transitive dependencies for each unit
         // This is needed for -L library search paths (rustc needs to find all transitive rlibs)
-        let transitive_deps: Vec<std::collections::HashSet<usize>> = {
-            use std::collections::HashSet;
+        // Uses Rc<FxHashSet> to avoid O(n²) cloning - computed sets are shared via Rc
+        let transitive_deps: Vec<Rc<rustc_hash::FxHashSet<usize>>> = {
+            type FxSet = rustc_hash::FxHashSet<usize>;
 
             // Build direct dependency map (unit index -> Vec of dep indices)
             let direct_deps: Vec<Vec<usize>> = graph
@@ -721,28 +757,33 @@ impl NixGenerator {
                 })
                 .collect();
 
-            // Compute transitive closure for each unit using DFS
+            // Compute transitive closure for each unit using DFS with Rc sharing
             fn transitive_closure(
                 unit_idx: usize,
                 direct_deps: &[Vec<usize>],
-                cache: &mut Vec<Option<HashSet<usize>>>,
-            ) -> HashSet<usize> {
+                cache: &mut [Option<Rc<FxSet>>],
+            ) -> Rc<FxSet> {
                 if let Some(cached) = &cache[unit_idx] {
-                    return cached.clone();
+                    return Rc::clone(cached); // Cheap Rc clone, not set clone
                 }
 
-                let mut result = HashSet::new();
+                // Pre-size based on direct deps (heuristic)
+                let mut result = FxSet::with_capacity_and_hasher(
+                    direct_deps[unit_idx].len() * 4,
+                    Default::default(),
+                );
                 for &dep_idx in &direct_deps[unit_idx] {
                     result.insert(dep_idx);
                     // Recursively add transitive deps
                     let trans = transitive_closure(dep_idx, direct_deps, cache);
-                    result.extend(trans);
+                    result.extend(trans.iter().copied());
                 }
-                cache[unit_idx] = Some(result.clone());
-                result
+                let rc = Rc::new(result);
+                cache[unit_idx] = Some(Rc::clone(&rc));
+                rc
             }
 
-            let mut cache: Vec<Option<HashSet<usize>>> = vec![None; graph.units.len()];
+            let mut cache: Vec<Option<Rc<FxSet>>> = vec![None; graph.units.len()];
             (0..graph.units.len())
                 .map(|i| transitive_closure(i, &direct_deps, &mut cache))
                 .collect()
@@ -759,8 +800,8 @@ impl NixGenerator {
         // derivations (to get their dependencies like tonic-build), and generate special
         // RUN derivations that execute the binary and capture cargo: directives.
         let mut build_script_run_derivations: Vec<String> = Vec::new();
-        let mut build_script_refs: std::collections::HashMap<usize, BuildScriptRef> =
-            std::collections::HashMap::new();
+        let mut build_script_refs: rustc_hash::FxHashMap<usize, BuildScriptRef> =
+            rustc_hash::FxHashMap::default();
 
         // First pass: identify all build script RUN units and their info
         // We need this map to wire up DEP_* variables between build scripts
@@ -771,8 +812,8 @@ impl NixGenerator {
             info: BuildScriptInfo,
         }
         let mut build_script_runs: Vec<BuildScriptRunInfo> = Vec::new();
-        let mut package_to_bs_run: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut package_to_bs_run: rustc_hash::FxHashMap<String, usize> =
+            rustc_hash::FxHashMap::default();
 
         for (i, unit) in graph.units.iter().enumerate() {
             if unit.mode == "run-custom-build" {
@@ -823,7 +864,7 @@ impl NixGenerator {
                         || u.target.kind.contains(&"rlib".to_string()))
             });
 
-            if let Some((lib_idx, lib_unit)) = lib_unit_idx {
+            if let Some((_, lib_unit)) = lib_unit_idx {
                 // For each dependency of the library unit, check if it has a build script
                 for dep in &lib_unit.dependencies {
                     if let Some(dep_unit) = graph.units.get(dep.index) {
@@ -897,6 +938,8 @@ impl NixGenerator {
                 &self.config.workspace_root,
                 self.config.content_addressed,
                 toolchain_var,
+                &drv_names[i],
+                &identity_hashes[i],
             );
 
             // Wire up dependencies, and detect if any dependency is a build script
@@ -920,7 +963,7 @@ impl NixGenerator {
                         nix_var: format!("units.\"{}\"", dep_drv_name),
                         extern_crate_name: dep.extern_crate_name.clone(),
                         lib_name,
-                        identity_hash: dep_unit.identity_hash(),
+                        identity_hash: identity_hashes[dep.index].clone(),
                         derivation_name: dep_drv_name.clone(),
                         is_proc_macro: dep_unit.is_proc_macro(),
                     });
@@ -1109,8 +1152,17 @@ mod tests {
 
         let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
+        let identity_hash = unit.identity_hash();
+        let drv_name = unit.derivation_name();
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
+        let drv = UnitDerivation::from_unit(
+            unit,
+            "/workspace",
+            false,
+            "rustToolchain",
+            &drv_name,
+            &identity_hash,
+        );
 
         assert_eq!(drv.pname, "my_crate");
         assert_eq!(drv.version, "0.1.0");
@@ -1375,8 +1427,17 @@ mod tests {
 
         let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
+        let identity_hash = unit.identity_hash();
+        let drv_name = unit.derivation_name();
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
+        let drv = UnitDerivation::from_unit(
+            unit,
+            "/workspace",
+            false,
+            "rustToolchain",
+            &drv_name,
+            &identity_hash,
+        );
         let build_phase = drv.generate_build_phase();
 
         // Check for proper flag formatting
@@ -1414,16 +1475,32 @@ mod tests {
 
         let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
+        let identity_hash = unit.identity_hash();
+        let drv_name = unit.derivation_name();
 
         // Without content-addressed
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
+        let drv = UnitDerivation::from_unit(
+            unit,
+            "/workspace",
+            false,
+            "rustToolchain",
+            &drv_name,
+            &identity_hash,
+        );
         let nix = drv.to_nix();
         assert!(!nix.contains("__contentAddressed"));
         assert!(!nix.contains("outputHashMode"));
         assert!(!nix.contains("outputHashAlgo"));
 
         // With content-addressed
-        let drv_ca = UnitDerivation::from_unit(unit, "/workspace", true, "rustToolchain");
+        let drv_ca = UnitDerivation::from_unit(
+            unit,
+            "/workspace",
+            true,
+            "rustToolchain",
+            &drv_name,
+            &identity_hash,
+        );
         let nix_ca = drv_ca.to_nix();
         assert!(nix_ca.contains("__contentAddressed = true"));
         assert!(nix_ca.contains("outputHashMode = \"recursive\""));
@@ -1742,8 +1819,17 @@ mod tests {
 
         let graph = parse_test_unit_graph(json);
         let unit = &graph.units[0];
+        let identity_hash = unit.identity_hash();
+        let drv_name = unit.derivation_name();
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace", false, "rustToolchain");
+        let drv = UnitDerivation::from_unit(
+            unit,
+            "/workspace",
+            false,
+            "rustToolchain",
+            &drv_name,
+            &identity_hash,
+        );
         let build_phase = drv.generate_build_phase();
 
         // Should use --out-dir for libraries (including proc-macros)

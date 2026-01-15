@@ -494,25 +494,42 @@ impl Unit {
             hasher.update(b"\0");
         }
 
-        // Sorted features for determinism
-        let mut features = self.features.clone();
-        features.sort();
-        for feature in &features {
-            hasher.update(feature.as_bytes());
+        // Sorted features for determinism - avoid clone by collecting indices and sorting
+        if self.features.is_empty() {
             hasher.update(b"\0");
+        } else {
+            let mut indices: Vec<usize> = (0..self.features.len()).collect();
+            indices.sort_by(|&a, &b| self.features[a].cmp(&self.features[b]));
+            for idx in indices {
+                hasher.update(self.features[idx].as_bytes());
+                hasher.update(b"\0");
+            }
         }
 
-        // Profile fields that affect compilation output
+        // Profile fields that affect compilation output - use discriminant bytes instead of Debug format
         hasher.update(self.profile.name.as_bytes());
         hasher.update(b"\0");
         hasher.update(self.profile.opt_level.as_bytes());
         hasher.update(b"\0");
-        hasher.update(format!("{:?}", self.profile.lto).as_bytes());
-        hasher.update(b"\0");
-        hasher.update(format!("{:?}", self.profile.debuginfo).as_bytes());
-        hasher.update(b"\0");
-        hasher.update(format!("{:?}", self.profile.panic).as_bytes());
-        hasher.update(b"\0");
+        // LTO: encode as single byte
+        hasher.update(match self.profile.lto {
+            LtoSetting::Off => b"0",
+            LtoSetting::Thin => b"1",
+            LtoSetting::Fat => b"2",
+        });
+        // DebugInfo: encode as single byte
+        hasher.update(match self.profile.debuginfo {
+            DebugInfo::None => b"0",
+            DebugInfo::LineDirectivesOnly => b"1",
+            DebugInfo::LineTablesOnly => b"2",
+            DebugInfo::Limited => b"3",
+            DebugInfo::Full => b"4",
+        });
+        // Panic: encode as single byte
+        hasher.update(match self.profile.panic {
+            PanicStrategy::Unwind => b"0",
+            PanicStrategy::Abort => b"1",
+        });
         hasher.update(if self.profile.debug_assertions {
             b"1"
         } else {
@@ -524,9 +541,11 @@ impl Unit {
             b"0"
         });
 
-        // Codegen units (affects output)
+        // Codegen units (affects output) - avoid to_string allocation
         if let Some(cgu) = self.profile.codegen_units {
-            hasher.update(cgu.to_string().as_bytes());
+            // Write number directly as bytes
+            let mut buf = itoa::Buffer::new();
+            hasher.update(buf.format(cgu).as_bytes());
         }
         hasher.update(b"\0");
 
