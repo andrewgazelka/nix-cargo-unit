@@ -7,11 +7,11 @@ Workers read this FIRST before exploring.
 | Path | Purpose |
 |------|---------|
 | `@src/main.rs` | CLI entry point - reads unit-graph JSON from stdin, outputs Nix or JSON |
-| `@src/unit_graph.rs` | Unit graph types (UnitGraph, Unit, Target, Profile, Dependency) and Nix codegen |
+| `@src/unit_graph.rs` | Unit graph types (UnitGraph, Unit, Target, Profile, Dependency) |
 | `@src/lib.rs` | Library exports - exposes unit_graph and rustc_flags modules |
 | `@src/rustc_flags.rs` | RustcFlags builder - generates rustc CLI args from unit metadata |
 | `@src/source_filter.rs` | Source location parsing, path remapping, Nix fileset generation |
-| `@src/nix_gen.rs` | Nix derivation code generation (to be created) |
+| `@src/nix_gen.rs` | Structured Nix derivation builder with proper escaping |
 | `@src/build_script.rs` | Build script handling (to be created) |
 | `@src/proc_macro.rs` | Proc-macro host compilation (to be created) |
 | `@flake.nix` | Nix flake with packages, devShells, overlays |
@@ -242,3 +242,95 @@ lib.fileset.toSource {
   ];
 }
 ```
+
+## From feature #5
+
+### Nix String Escaping
+`NixString::new(s)` properly escapes for Nix double-quoted strings:
+- `\\` -> `\`
+- `\"` -> `"`
+- `\n`, `\r`, `\t` for whitespace
+- `$` always escaped to prevent interpolation
+
+`escape_nix_multiline(s)` for `''...''` strings:
+- `''` -> `'''` (escape delimiter)
+- `${` -> `''${` (escape interpolation)
+
+### NixAttrSet Builder
+Type-safe attribute set construction:
+```rust
+let mut attrs = NixAttrSet::new();
+attrs.string("pname", "my-crate");      // Quoted: pname = "my-crate";
+attrs.expr("deps", "[ dep1 dep2 ]");    // Raw: deps = [ dep1 dep2 ];
+attrs.bool("dontUnpack", true);         // dontUnpack = true;
+attrs.string_list("features", &feats); // features = [ "std" "alloc" ];
+attrs.multiline("buildPhase", script);  // buildPhase = ''...script...'';
+attrs.render(2)                         // Render with 2-level indent
+```
+
+### UnitDerivation Builder
+`UnitDerivation::from_unit(&unit, workspace_root)` creates a derivation:
+- Uses `unit.derivation_name()` for unique names
+- Remaps source paths via `remap_source_path()`
+- Generates build phase with rustc flags
+- Handles bin vs lib vs proc-macro output paths
+
+### NixGenerator
+Main entry point for Nix generation:
+```rust
+let config = NixGenConfig {
+    workspace_root: "/workspace".to_string(),
+    content_addressed: false,
+};
+let generator = NixGenerator::new(config);
+let nix = generator.generate(&graph);
+```
+
+Output structure:
+```nix
+{ pkgs, rustToolchain, src }:
+let
+  mkUnit = attrs: pkgs.stdenv.mkDerivation (attrs // { ... });
+  units = {
+    "crate-0.1.0-abc123" = mkUnit { ... };
+    "_idx_0" = units."crate-0.1.0-abc123"; # index alias
+  };
+in {
+  inherit units;
+  roots = [ ... ];
+  default = ...;
+}
+```
+
+### CLI Workspace Root Flag
+CLI now accepts `--workspace-root` / `-w` for source path remapping:
+```bash
+cargo --unit-graph | nix-cargo-unit -w /path/to/workspace
+```
+
+## From feature #6
+
+### Content-Addressed Derivations
+`--content-addressed` CLI flag enables CA-derivation attributes in generated Nix:
+```bash
+cargo --unit-graph | nix-cargo-unit --content-addressed -w /path/to/workspace
+```
+
+Generated derivations include:
+```nix
+__contentAddressed = true;
+outputHashMode = "recursive";
+outputHashAlgo = "sha256";
+```
+
+### NixGenConfig.content_addressed
+Pass `content_addressed: true` to `NixGenConfig` to enable CA attributes:
+```rust
+let config = NixGenConfig {
+    workspace_root: "/workspace".to_string(),
+    content_addressed: true,
+};
+```
+
+### UnitDerivation.from_unit signature
+`UnitDerivation::from_unit(unit, workspace_root, content_addressed)` now takes a third parameter to control CA attributes.

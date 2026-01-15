@@ -178,6 +178,22 @@ impl NixAttrSet {
     }
 }
 
+/// A dependency reference for a unit derivation.
+#[derive(Debug, Clone)]
+pub struct DepRef {
+    /// Nix variable name for the dependency derivation.
+    pub nix_var: String,
+
+    /// Extern crate name (used in --extern flag).
+    pub extern_crate_name: String,
+
+    /// Derivation name (for reference).
+    pub derivation_name: String,
+
+    /// Whether this is a proc-macro dependency.
+    pub is_proc_macro: bool,
+}
+
 /// A builder for a single unit derivation.
 #[derive(Debug)]
 pub struct UnitDerivation {
@@ -208,8 +224,8 @@ pub struct UnitDerivation {
     /// Whether this is a test build.
     pub is_test: bool,
 
-    /// Dependencies (references to other unit derivations).
-    pub deps: Vec<String>,
+    /// Dependencies with extern crate info.
+    pub deps: Vec<DepRef>,
 
     /// The rustc flags (precomputed).
     pub rustc_flags: RustcFlags,
@@ -250,9 +266,9 @@ impl UnitDerivation {
         }
     }
 
-    /// Adds a dependency reference.
-    pub fn add_dep(&mut self, dep_ref: &str) {
-        self.deps.push(dep_ref.to_string());
+    /// Adds a dependency reference with extern crate info.
+    pub fn add_dep(&mut self, dep_ref: DepRef) {
+        self.deps.push(dep_ref);
     }
 
     /// Generates the Nix derivation expression.
@@ -262,9 +278,10 @@ impl UnitDerivation {
         attrs.string("pname", &self.pname);
         attrs.string("version", &self.version);
 
-        // Build inputs (dependencies)
+        // Build inputs (dependencies) - use the nix_var for each dep
         if !self.deps.is_empty() {
-            attrs.expr_list("buildInputs", &self.deps);
+            let dep_vars: Vec<String> = self.deps.iter().map(|d| d.nix_var.clone()).collect();
+            attrs.expr_list("buildInputs", &dep_vars);
         } else {
             attrs.expr("buildInputs", "[]");
         }
@@ -293,7 +310,13 @@ impl UnitDerivation {
     fn generate_build_phase(&self) -> String {
         let mut script = String::new();
 
-        script.push_str("mkdir -p $out/lib\n");
+        // Create output directories
+        if self.crate_types.contains(&"bin".to_string()) {
+            script.push_str("mkdir -p $out/bin\n");
+        } else {
+            script.push_str("mkdir -p $out/lib\n");
+        }
+
         script.push_str("rustc \\\n");
 
         // Add each flag on its own line for readability
@@ -310,6 +333,40 @@ impl UnitDerivation {
             script.push_str(" \\\n");
         }
 
+        // Add -L library search paths for all dependencies
+        // This allows rustc to find transitive .rlib files
+        for dep in &self.deps {
+            script.push_str("  -L ");
+            script.push_str(&format!("dependency={}/lib", dep.nix_var));
+            script.push_str(" \\\n");
+        }
+
+        // Add --extern flags for each dependency
+        for dep in &self.deps {
+            script.push_str("  --extern ");
+            // Determine the library file name based on whether it's a proc-macro
+            let lib_file = if dep.is_proc_macro {
+                // Proc-macros are shared libraries (.so on Linux, .dylib on macOS)
+                // Use a glob pattern since extension varies by platform
+                format!(
+                    "{}=\"$(find {}/lib -name 'lib{}.*' -type f | head -1)\"",
+                    dep.extern_crate_name,
+                    dep.nix_var,
+                    dep.extern_crate_name.replace('-', "_")
+                )
+            } else {
+                // Regular dependencies use .rlib
+                format!(
+                    "{}={}/lib/lib{}.rlib",
+                    dep.extern_crate_name,
+                    dep.nix_var,
+                    dep.extern_crate_name.replace('-', "_")
+                )
+            };
+            script.push_str(&lib_file);
+            script.push_str(" \\\n");
+        }
+
         // Add source file
         script.push_str("  ");
         script.push_str(&self.src_path);
@@ -319,9 +376,10 @@ impl UnitDerivation {
         let output_name = if self.crate_types.contains(&"bin".to_string()) {
             format!("$out/bin/{}", self.pname)
         } else if self.crate_types.contains(&"proc-macro".to_string()) {
-            format!("$out/lib/lib{}.so", self.pname)
+            // Proc-macros are shared libraries
+            format!("$out/lib/lib{}.so", self.pname.replace('-', "_"))
         } else {
-            format!("$out/lib/lib{}.rlib", self.pname)
+            format!("$out/lib/lib{}.rlib", self.pname.replace('-', "_"))
         };
         script.push_str("  -o ");
         script.push_str(&output_name);
@@ -380,15 +438,32 @@ impl NixGenerator {
         out.push_str("    dontConfigure = true;\n");
         out.push_str("  });\n\n");
 
+        // Pre-compute derivation names for all units (needed for dependency resolution)
+        let drv_names: Vec<String> = graph.units.iter().map(|u| u.derivation_name()).collect();
+
         // Generate derivations for each unit
         out.push_str("  units = {\n");
 
         for (i, unit) in graph.units.iter().enumerate() {
-            let drv = UnitDerivation::from_unit(
+            let mut drv = UnitDerivation::from_unit(
                 unit,
                 &self.config.workspace_root,
                 self.config.content_addressed,
             );
+
+            // Wire up dependencies
+            for dep in &unit.dependencies {
+                if let Some(dep_unit) = graph.units.get(dep.index) {
+                    let dep_drv_name = &drv_names[dep.index];
+                    drv.add_dep(DepRef {
+                        nix_var: format!("units.\"{}\"", dep_drv_name),
+                        extern_crate_name: dep.extern_crate_name.clone(),
+                        derivation_name: dep_drv_name.clone(),
+                        is_proc_macro: dep_unit.is_proc_macro(),
+                    });
+                }
+            }
+
             let drv_name = &drv.name;
 
             out.push_str(&format!("    \"{}\" = mkUnit ", drv_name));
@@ -617,6 +692,129 @@ mod tests {
 
         // Should have bin output path
         assert!(nix.contains("$out/bin/app"));
+
+        // Should have --extern flag for dependency
+        assert!(nix.contains("--extern"));
+        assert!(nix.contains("dep="));
+        assert!(nix.contains("/lib/libdep.rlib"));
+
+        // Should have -L flag for library search path
+        assert!(nix.contains("-L"));
+        assert!(nix.contains("dependency="));
+    }
+
+    #[test]
+    fn test_extern_crate_wiring() {
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "name": "serde",
+                        "src_path": "/registry/serde/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": ["default", "std"],
+                    "mode": "build",
+                    "dependencies": []
+                },
+                {
+                    "pkg_id": "serde_derive 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                    "target": {
+                        "kind": ["proc-macro"],
+                        "crate_types": ["proc-macro"],
+                        "name": "serde_derive",
+                        "src_path": "/registry/serde_derive/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [],
+                    "platform": "aarch64-apple-darwin"
+                },
+                {
+                    "pkg_id": "my_app 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "name": "my_app",
+                        "src_path": "/workspace/src/main.rs",
+                        "edition": "2024"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "serde", "public": false},
+                        {"index": 1, "extern_crate_name": "serde_derive", "public": false}
+                    ]
+                }
+            ],
+            "roots": [2]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+        let config = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+        };
+
+        let generator = NixGenerator::new(config);
+        let nix = generator.generate(&graph);
+
+        // Should have all three units
+        assert!(nix.contains("pname = \"serde\""));
+        assert!(nix.contains("pname = \"serde_derive\""));
+        assert!(nix.contains("pname = \"my_app\""));
+
+        // my_app should have buildInputs with both dependencies
+        assert!(nix.contains("buildInputs = ["));
+
+        // Should have --extern flags for both dependencies
+        assert!(nix.contains("serde="));
+        assert!(nix.contains("serde_derive="));
+
+        // Regular lib dep should use .rlib
+        assert!(nix.contains("libserde.rlib"));
+
+        // Proc-macro dep should use find for dynamic lib
+        assert!(nix.contains("find") && nix.contains("serde_derive"));
+    }
+
+    #[test]
+    fn test_dep_ref_in_build_inputs() {
+        let mut drv = UnitDerivation {
+            name: "test-0.1.0-abc123".to_string(),
+            pname: "test".to_string(),
+            version: "0.1.0".to_string(),
+            edition: "2024".to_string(),
+            crate_types: vec!["lib".to_string()],
+            src_path: "${src}/src/lib.rs".to_string(),
+            features: vec![],
+            opt_level: "0".to_string(),
+            is_test: false,
+            deps: vec![],
+            rustc_flags: RustcFlags::new(),
+            content_addressed: false,
+        };
+
+        // Add a dependency
+        drv.add_dep(DepRef {
+            nix_var: "units.\"dep-0.1.0-xyz789\"".to_string(),
+            extern_crate_name: "dep".to_string(),
+            derivation_name: "dep-0.1.0-xyz789".to_string(),
+            is_proc_macro: false,
+        });
+
+        let nix = drv.to_nix();
+
+        // Should have the dependency in buildInputs
+        assert!(nix.contains("buildInputs = [ units.\"dep-0.1.0-xyz789\" ]"));
     }
 
     #[test]
