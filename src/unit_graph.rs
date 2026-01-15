@@ -308,48 +308,54 @@ impl Default for StripSetting {
     }
 }
 
+impl StripSetting {
+    fn from_str_value(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "none" | "false" => StripSetting::None,
+            "debuginfo" => StripSetting::Debuginfo,
+            "symbols" | "true" => StripSetting::Symbols,
+            _ => StripSetting::None,
+        }
+    }
+}
+
 impl<'de> serde::Deserialize<'de> for StripSetting {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct StripVisitor;
+        // First, try to deserialize as a generic JSON value to handle all formats
+        let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
 
-        impl serde::de::Visitor<'_> for StripVisitor {
-            type Value = StripSetting;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a boolean or string strip setting")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(if v {
+        Ok(match value {
+            serde_json::Value::Bool(b) => {
+                if b {
                     StripSetting::Symbols
                 } else {
                     StripSetting::None
-                })
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                match v {
-                    "none" | "false" => Ok(StripSetting::None),
-                    "debuginfo" => Ok(StripSetting::Debuginfo),
-                    "symbols" | "true" => Ok(StripSetting::Symbols),
-                    other => Err(serde::de::Error::unknown_variant(
-                        other,
-                        &["none", "debuginfo", "symbols"],
-                    )),
                 }
             }
-        }
-
-        deserializer.deserialize_any(StripVisitor)
+            serde_json::Value::String(s) => StripSetting::from_str_value(&s),
+            serde_json::Value::Object(obj) => {
+                // Handle new format: {"resolved": {"Named": "debuginfo"}} or {"resolved": "None"}
+                if let Some(resolved) = obj.get("resolved") {
+                    match resolved {
+                        serde_json::Value::String(s) => StripSetting::from_str_value(s),
+                        serde_json::Value::Object(inner) => {
+                            if let Some(serde_json::Value::String(s)) = inner.get("Named") {
+                                StripSetting::from_str_value(s)
+                            } else {
+                                StripSetting::None
+                            }
+                        }
+                        _ => StripSetting::None,
+                    }
+                } else {
+                    StripSetting::None
+                }
+            }
+            _ => StripSetting::None,
+        })
     }
 }
 

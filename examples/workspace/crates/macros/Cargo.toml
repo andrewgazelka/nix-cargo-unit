@@ -1,0 +1,12 @@
+[package]
+name = "example-macros"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Proc-macro crate for nix-cargo-unit testing"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# Minimal deps - just what's needed for basic proc-macros

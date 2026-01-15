@@ -1,0 +1,102 @@
+{
+  description = "Example workspace for nix-cargo-unit end-to-end testing";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Reference the parent flake for nix-cargo-unit
+    nix-cargo-unit.url = "path:../..";
+    nix-cargo-unit.inputs.nixpkgs.follows = "nixpkgs";
+    nix-cargo-unit.inputs.rust-overlay.follows = "rust-overlay";
+  };
+
+  outputs = {
+    self,
+    nixpkgs,
+    rust-overlay,
+    nix-cargo-unit,
+  }: let
+    systems = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
+    forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+  in {
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
+
+      # Nightly toolchain required for --unit-graph
+      rustToolchain = pkgs.rust-bin.nightly.latest.default;
+
+      # Get the nix-cargo-unit library
+      cargoUnit = nix-cargo-unit.mkLib pkgs;
+
+      # Build the entire workspace using nix-cargo-unit
+      workspace = cargoUnit.buildWorkspace {
+        src = ./.;
+        inherit rustToolchain;
+        # Enable CA-derivations for content-addressed outputs
+        contentAddressed = true;
+        # Default release profile
+        profile = "release";
+      };
+    in {
+      # The main app binary
+      default = workspace.default;
+
+      # Access individual workspace members
+      example-app = workspace.packages.example-app or workspace.binaries.example-app or workspace.default;
+      example-core = workspace.packages.example-core or workspace.libraries.example-core or null;
+      example-macros = workspace.packages.example-macros or workspace.libraries.example-macros or null;
+
+      # All binaries for deployment
+      inherit (workspace) binaries;
+
+      # All libraries
+      inherit (workspace) libraries;
+
+      # Full workspace result for inspection
+      workspace-result = workspace;
+
+      # Debug: expose intermediate outputs
+      unit-graph-json = workspace.unitGraphJson;
+      units-nix = workspace.unitsNix;
+    });
+
+    # Dev shell for working on the example
+    devShells = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
+      rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
+        extensions = ["rust-src" "rust-analyzer"];
+      };
+    in {
+      default = pkgs.mkShell {
+        packages = [
+          rustToolchain
+          pkgs.cargo-watch
+        ];
+      };
+    });
+
+    # Checks to validate the workspace builds correctly
+    checks = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
+      rustToolchain = pkgs.rust-bin.nightly.latest.default;
+      cargoUnit = nix-cargo-unit.mkLib pkgs;
+
+      workspace = cargoUnit.buildWorkspace {
+        src = ./.;
+        inherit rustToolchain;
+        contentAddressed = true;
+      };
+    in {
+      # Test that the app binary runs correctly
+      app-runs = pkgs.runCommand "test-app-runs" {} ''
+        ${workspace.default}/bin/example-app > $out
+        grep "All features working" $out
+      '';
+
+      # Test that the workspace builds
+      workspace-builds = workspace.default;
+    });
+  };
+}

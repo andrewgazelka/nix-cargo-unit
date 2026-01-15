@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+example-core = { path = "crates/core" }
+example-macros = { path = "crates/macros" }

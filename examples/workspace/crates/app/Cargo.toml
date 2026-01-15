@@ -1,0 +1,17 @@
+[package]
+name = "example-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Example application using core lib and proc-macros"
+
+[[bin]]
+name = "example-app"
+path = "src/main.rs"
+
+[dependencies]
+example-core.workspace = true
+example-macros.workspace = true
+
+[build-dependencies]
+# No external deps
