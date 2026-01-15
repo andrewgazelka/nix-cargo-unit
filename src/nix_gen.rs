@@ -20,10 +20,10 @@ pub struct VersionParts<'a> {
 impl<'a> VersionParts<'a> {
     /// Parses version components from a version string like "1.2.3" or "1.2.3-alpha".
     pub fn parse(version: &'a str) -> Self {
-        let parts: Vec<&str> = version.split('.').collect();
-        let major = parts.first().copied().unwrap_or("0");
-        let minor = parts.get(1).copied().unwrap_or("0");
-        let patch_full = parts.get(2).copied().unwrap_or("0");
+        let mut parts = version.split('.');
+        let major = parts.next().unwrap_or("0");
+        let minor = parts.next().unwrap_or("0");
+        let patch_full = parts.next().unwrap_or("0");
         // Strip any pre-release suffix from patch (e.g., "0-alpha" -> "0")
         let patch = patch_full.split('-').next().unwrap_or("0");
         Self {
@@ -118,7 +118,8 @@ impl std::fmt::Display for NixString {
 /// - `${` -> literal `${` (interpolation escape)
 fn escape_nix_string(s: &str) -> String {
     let mut result = String::with_capacity(s.len() + 16);
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
             '\\' => result.push_str("\\\\"),
             '"' => result.push_str("\\\""),
@@ -126,9 +127,12 @@ fn escape_nix_string(s: &str) -> String {
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             '$' => {
-                // Check if next char is '{' - but we only have current char
-                // So we escape all $ to be safe
-                result.push_str("\\$");
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    result.push_str("\\${");
+                } else {
+                    result.push('$');
+                }
             }
             c => result.push(c),
         }
@@ -142,13 +146,42 @@ fn escape_nix_string(s: &str) -> String {
 /// - `''$` -> literal `$`
 /// - `'''` -> literal `''`
 pub fn escape_nix_multiline(s: &str) -> String {
-    s.replace("''", "'''").replace("${", "''${")
+    let mut result = String::with_capacity(s.len() + 8);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                result.push_str("'''");
+            }
+            '$' if chars.peek() == Some(&'{') => {
+                chars.next();
+                result.push_str("''${");
+            }
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 /// A builder for Nix attribute sets.
 #[derive(Debug, Default)]
 pub struct NixAttrSet {
-    attrs: Vec<(String, String)>,
+    attrs: Vec<(String, NixValue)>,
+}
+
+#[derive(Debug)]
+enum NixValue {
+    Inline(String),
+    Multiline(String),
+}
+
+impl NixValue {
+    fn len(&self) -> usize {
+        match self {
+            Self::Inline(value) | Self::Multiline(value) => value.len(),
+        }
+    }
 }
 
 impl NixAttrSet {
@@ -159,23 +192,24 @@ impl NixAttrSet {
 
     /// Adds a string attribute.
     pub fn string(&mut self, key: &str, value: &str) -> &mut Self {
-        self.attrs
-            .push((key.to_string(), format!("\"{}\"", escape_nix_string(value))));
+        self.attrs.push((
+            key.to_string(),
+            NixValue::Inline(format!("\"{}\"", escape_nix_string(value))),
+        ));
         self
     }
 
     /// Adds a raw Nix expression (not quoted).
     pub fn expr(&mut self, key: &str, value: &str) -> &mut Self {
-        self.attrs.push((key.to_string(), value.to_string()));
+        self.attrs
+            .push((key.to_string(), NixValue::Inline(value.to_string())));
         self
     }
 
     /// Adds a boolean attribute.
     pub fn bool(&mut self, key: &str, value: bool) -> &mut Self {
-        self.attrs.push((
-            key.to_string(),
-            if value { "true" } else { "false" }.to_string(),
-        ));
+        self.attrs
+            .push((key.to_string(), NixValue::Inline(value.to_string())));
         self
     }
 
@@ -193,7 +227,8 @@ impl NixAttrSet {
 
     /// Adds an integer attribute.
     pub fn int(&mut self, key: &str, value: i64) -> &mut Self {
-        self.attrs.push((key.to_string(), value.to_string()));
+        self.attrs
+            .push((key.to_string(), NixValue::Inline(value.to_string())));
         self
     }
 
@@ -211,7 +246,8 @@ impl NixAttrSet {
             result.push('"');
         }
         result.push_str(" ]");
-        self.attrs.push((key.to_owned(), result));
+        self.attrs
+            .push((key.to_owned(), NixValue::Inline(result)));
         self
     }
 
@@ -227,7 +263,8 @@ impl NixAttrSet {
             result.push_str(v);
         }
         result.push_str(" ]");
-        self.attrs.push((key.to_owned(), result));
+        self.attrs
+            .push((key.to_owned(), NixValue::Inline(result)));
         self
     }
 
@@ -236,7 +273,7 @@ impl NixAttrSet {
     pub fn multiline(&mut self, key: &str, value: &str) -> &mut Self {
         self.attrs.push((
             key.to_string(),
-            format!("''\n{}\n''", escape_nix_multiline(value)),
+            NixValue::Multiline(format!("''\n{}\n''", escape_nix_multiline(value))),
         ));
         self
     }
@@ -248,8 +285,10 @@ impl NixAttrSet {
     /// - Use ''' for literal ''
     pub fn multiline_interpolated(&mut self, key: &str, value: &str) -> &mut Self {
         // No escaping - caller handles Nix syntax
-        self.attrs
-            .push((key.to_string(), format!("''\n{}\n''", value)));
+        self.attrs.push((
+            key.to_string(),
+            NixValue::Multiline(format!("''\n{}\n''", value)),
+        ));
         self
     }
 
@@ -259,32 +298,35 @@ impl NixAttrSet {
         let inner_indent = "  ".repeat(indent + 1);
 
         // Pre-allocate based on content size
-        let estimated_size: usize = self.attrs.iter().map(|(k, v)| k.len() + v.len() + 10).sum();
+        let estimated_size: usize = self
+            .attrs
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 10)
+            .sum();
         let mut out = String::with_capacity(estimated_size + 64);
         out.push_str("{\n");
 
         for (key, value) in &self.attrs {
-            // Handle multiline values specially
-            if value.starts_with("''") && value.contains('\n') {
-                out.push_str(&inner_indent);
-                out.push_str(key);
-                out.push_str(" = ");
-                // Iterate lines directly without collecting
-                for (i, line) in value.lines().enumerate() {
-                    if i > 0 {
-                        out.push('\n');
-                        out.push_str(&inner_indent);
-                        out.push_str("  ");
-                    }
-                    out.push_str(line);
+            out.push_str(&inner_indent);
+            out.push_str(key);
+            out.push_str(" = ");
+            match value {
+                NixValue::Inline(value) => {
+                    out.push_str(value);
+                    out.push_str(";\n");
                 }
-                out.push_str(";\n");
-            } else {
-                out.push_str(&inner_indent);
-                out.push_str(key);
-                out.push_str(" = ");
-                out.push_str(value);
-                out.push_str(";\n");
+                NixValue::Multiline(value) => {
+                    // Iterate lines directly without collecting
+                    for (i, line) in value.lines().enumerate() {
+                        if i > 0 {
+                            out.push('\n');
+                            out.push_str(&inner_indent);
+                            out.push_str("  ");
+                        }
+                        out.push_str(line);
+                    }
+                    out.push_str(";\n");
+                }
             }
         }
 
@@ -574,7 +616,12 @@ impl UnitDerivation {
 
         // Debug: enable command tracing to see the actual rustc command
         script.push_str("set -x\n");
-        script.push_str("rustc \\\n");
+
+        // Remap build directory paths to a stable prefix for reproducibility.
+        // The Nix sandbox builds in a temp directory like /nix/var/nix/builds/nix-XXXXX
+        // which gets embedded in proc-macro dylib metadata. Remapping to $out ensures
+        // the embedded paths are stable across rebuilds.
+        script.push_str("rustc --remap-path-prefix=\"$(pwd)\"=\"$out\" \\\n");
 
         // Add each flag on its own line for readability
         for arg in self.rustc_flags.args() {
@@ -931,26 +978,24 @@ impl NixGenerator {
                         // Skip the current package's own build script to avoid self-reference
                         if dep_unit.mode == "run-custom-build"
                             && dep_unit.package_name() != bs_run.package_name
-                        {
-                            if let Some(other_bs_run_idx) =
+                            && let Some(other_bs_run_idx) =
                                 package_to_bs_run.get(dep_unit.package_name())
-                            {
-                                let other_bs = &build_script_runs[*other_bs_run_idx];
-                                dep_bs_outputs
-                                    .push(format!("units.\"{}\"", other_bs.info.run_drv_name));
-                            }
+                        {
+                            let other_bs = &build_script_runs[*other_bs_run_idx];
+                            dep_bs_outputs
+                                .push(format!("units.\"{}\"", other_bs.info.run_drv_name));
                         }
                         // Also check if the dependency's package has a build script
                         // (in case it's a lib unit that depends on another lib)
                         // Skip the current package's own build script to avoid self-reference
                         let dep_pkg_name = dep_unit.package_name();
-                        if dep_pkg_name != bs_run.package_name {
-                            if let Some(other_bs_run_idx) = package_to_bs_run.get(dep_pkg_name) {
-                                let other_bs = &build_script_runs[*other_bs_run_idx];
-                                let run_var = format!("units.\"{}\"", other_bs.info.run_drv_name);
-                                if !dep_bs_outputs.contains(&run_var) {
-                                    dep_bs_outputs.push(run_var);
-                                }
+                        if dep_pkg_name != bs_run.package_name
+                            && let Some(other_bs_run_idx) = package_to_bs_run.get(dep_pkg_name)
+                        {
+                            let other_bs = &build_script_runs[*other_bs_run_idx];
+                            let run_var = format!("units.\"{}\"", other_bs.info.run_drv_name);
+                            if !dep_bs_outputs.contains(&run_var) {
+                                dep_bs_outputs.push(run_var);
                             }
                         }
                     }

@@ -77,6 +77,14 @@ impl RustcFlags {
             self.push_arg("--crate-type");
             self.push_arg(crate_type);
         }
+
+        // Proc-macros need -C prefer-dynamic to link against shared libstd.
+        // This is required because proc-macros are dynamically loaded by rustc,
+        // and they need to use the same allocator/runtime as rustc.
+        if target.crate_types.iter().any(|t| t == "proc-macro") {
+            self.push_arg("-C");
+            self.push_arg("prefer-dynamic");
+        }
     }
 
     /// Adds all profile-related codegen flags.

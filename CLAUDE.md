@@ -9,6 +9,6 @@ one nixbld user but validated by another. Fix is in `src/libstore/unix/build/der
 
 ## Reference Code
 Useful:
-~/Projects/rust
-~/Projects/cargo
-~/Projects/nix (custom nix with CA fixes)
+- ~/Projects/rust
+- ~/Projects/cargo
+- ~/Projects/nix (custom nix with CA fixes)
