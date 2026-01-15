@@ -837,11 +837,38 @@ impl NixGenerator {
         out.push_str("    dontConfigure = true;\n");
         out.push_str("  });\n\n");
 
+        // DEDUPLICATION: Units with the same logical identity (pkg_id, features, profile, mode,
+        // target, platform) should map to a single derivation. Build a mapping from unit index
+        // to "canonical" unit index (first occurrence of each unique logical identity).
+        //
+        // This is necessary because Cargo's unit graph can contain duplicate entries for the
+        // same logical unit when it appears through different dependency paths. Without
+        // deduplication, each occurrence gets a different identity hash (because dependency
+        // indices differ), leading to multiple derivations for the same crate. This causes
+        // rustc SVH mismatches at compile time.
+        let canonical_index: Vec<usize> = {
+            let mut identity_to_canonical: rustc_hash::FxHashMap<String, usize> =
+                rustc_hash::FxHashMap::default();
+            graph
+                .units
+                .iter()
+                .enumerate()
+                .map(|(idx, unit)| {
+                    // Use identity_hash() WITHOUT deps as the logical identity key
+                    let key = unit.identity_hash();
+                    *identity_to_canonical.entry(key).or_insert(idx)
+                })
+                .collect()
+        };
+
         // Pre-compute identity hashes and derivation names for all units (needed for dependency resolution)
         //
         // CRITICAL: Hashes must be computed in TOPOLOGICAL ORDER with dependency hashes included!
         // This ensures rustc unification works correctly - when a dependency's hash changes,
         // all dependents' hashes also change, matching how rustc embeds SVH into rlib metadata.
+        //
+        // NOTE: We use canonical_index to map dependency indices to their canonical form,
+        // ensuring duplicates get the same hash.
         let identity_hashes: Vec<String> = {
             let mut hashes: Vec<Option<String>> = vec![None; graph.units.len()];
             let toolchain_hash = self.config.toolchain_hash.as_deref();
@@ -852,14 +879,18 @@ impl NixGenerator {
                 graph: &UnitGraph,
                 hashes: &mut [Option<String>],
                 toolchain_hash: Option<&str>,
+                canonical_index: &[usize],
             ) -> String {
-                if let Some(ref h) = hashes[idx] {
+                // Use canonical index for looking up cached hashes
+                let canonical_idx = canonical_index[idx];
+                if let Some(ref h) = hashes[canonical_idx] {
                     return h.clone();
                 }
 
                 // First, compute hashes for all dependencies (recursively)
-                let unit = &graph.units[idx];
-                let dep_hashes: Vec<String> = unit
+                // Use canonical unit to ensure consistent dependency set across duplicates
+                let canonical_unit = &graph.units[canonical_idx];
+                let dep_hashes: Vec<String> = canonical_unit
                     .dependencies
                     .iter()
                     .filter_map(|dep| {
@@ -868,7 +899,14 @@ impl NixGenerator {
                             if dep_unit.mode == "run-custom-build" {
                                 None
                             } else {
-                                Some(compute_hash(dep.index, graph, hashes, toolchain_hash))
+                                // Use canonical index for recursive calls
+                                Some(compute_hash(
+                                    dep.index,
+                                    graph,
+                                    hashes,
+                                    toolchain_hash,
+                                    canonical_index,
+                                ))
                             }
                         })
                     })
@@ -876,7 +914,7 @@ impl NixGenerator {
 
                 // Now compute this unit's hash with dependency hashes included
                 let dep_refs: Vec<&str> = dep_hashes.iter().map(String::as_str).collect();
-                let mut hash = unit.identity_hash_with_deps(&dep_refs);
+                let mut hash = canonical_unit.identity_hash_with_deps(&dep_refs);
 
                 // Include toolchain hash to prevent stale CA outputs when rustc changes
                 // This ensures derivation names change when the Nix toolchain store path changes
@@ -893,41 +931,53 @@ impl NixGenerator {
                     );
                 }
 
-                hashes[idx] = Some(hash.clone());
+                // Store at canonical index so all duplicates share the same hash
+                hashes[canonical_idx] = Some(hash.clone());
                 hash
             }
 
             // Compute hashes for all units
             for i in 0..graph.units.len() {
-                compute_hash(i, graph, &mut hashes, toolchain_hash);
+                compute_hash(i, graph, &mut hashes, toolchain_hash, &canonical_index);
             }
 
-            hashes.into_iter().map(|h| h.unwrap()).collect()
+            // Map each unit to its canonical hash (duplicates share the same hash)
+            (0..graph.units.len())
+                .map(|i| hashes[canonical_index[i]].clone().unwrap())
+                .collect()
         };
 
-        let drv_names: Vec<String> = graph
-            .units
-            .iter()
-            .zip(&identity_hashes)
-            .map(|(u, hash)| {
+        // Derivation names: all duplicates map to the same name (canonical unit's name)
+        let drv_names: Vec<String> = (0..graph.units.len())
+            .map(|i| {
+                let canonical_idx = canonical_index[i];
+                let u = &graph.units[canonical_idx];
+                let hash = &identity_hashes[i];
                 let name = &u.target.name;
                 let version = u.package_version().unwrap_or("0.0.0");
                 format!("{name}-{version}-{hash}")
             })
             .collect();
 
-        // Compute transitive dependencies for each unit
+        // Compute transitive dependencies for each unit (using canonical indices)
         // This is needed for -L library search paths (rustc needs to find all transitive rlibs)
         // Uses Rc<FxHashSet> to avoid O(n²) cloning - computed sets are shared via Rc
+        //
+        // IMPORTANT: We map all dependency indices to their canonical form to ensure
+        // that duplicate units result in the same transitive dep set.
         let transitive_deps: Vec<Rc<rustc_hash::FxHashSet<usize>>> = {
             type FxSet = rustc_hash::FxHashSet<usize>;
 
-            // Build direct dependency map (unit index -> Vec of dep indices)
+            // Build direct dependency map (unit index -> Vec of CANONICAL dep indices)
             let direct_deps: Vec<Vec<usize>> = graph
                 .units
                 .iter()
-                .map(|unit| {
-                    unit.dependencies
+                .enumerate()
+                .map(|(i, _unit)| {
+                    // Use canonical unit's dependencies for consistency
+                    let canonical_unit = &graph.units[canonical_index[i]];
+                    canonical_unit
+                        .dependencies
                         .iter()
                         .filter_map(|d| {
                             // Skip build script run units for transitive deps
@@ -935,7 +985,8 @@ impl NixGenerator {
                                 .units
                                 .get(d.index)
                                 .filter(|dep_unit| dep_unit.mode != "run-custom-build")
-                                .map(|_| d.index)
+                                // Map to canonical index!
+                                .map(|_| canonical_index[d.index])
                         })
                         .collect()
                 })
@@ -946,30 +997,34 @@ impl NixGenerator {
                 unit_idx: usize,
                 direct_deps: &[Vec<usize>],
                 cache: &mut [Option<Rc<FxSet>>],
+                canonical_index: &[usize],
             ) -> Rc<FxSet> {
-                if let Some(cached) = &cache[unit_idx] {
+                // Use canonical index for caching
+                let canonical_idx = canonical_index[unit_idx];
+                if let Some(cached) = &cache[canonical_idx] {
                     return Rc::clone(cached); // Cheap Rc clone, not set clone
                 }
 
                 // Pre-size based on direct deps (heuristic)
                 let mut result = FxSet::with_capacity_and_hasher(
-                    direct_deps[unit_idx].len() * 4,
+                    direct_deps[canonical_idx].len() * 4,
                     Default::default(),
                 );
-                for &dep_idx in &direct_deps[unit_idx] {
+                for &dep_idx in &direct_deps[canonical_idx] {
+                    // dep_idx is already canonical (mapped above)
                     result.insert(dep_idx);
                     // Recursively add transitive deps
-                    let trans = transitive_closure(dep_idx, direct_deps, cache);
+                    let trans = transitive_closure(dep_idx, direct_deps, cache, canonical_index);
                     result.extend(trans.iter().copied());
                 }
                 let rc = Rc::new(result);
-                cache[unit_idx] = Some(Rc::clone(&rc));
+                cache[canonical_idx] = Some(Rc::clone(&rc));
                 rc
             }
 
             let mut cache: Vec<Option<Rc<FxSet>>> = vec![None; graph.units.len()];
             (0..graph.units.len())
-                .map(|i| transitive_closure(i, &direct_deps, &mut cache))
+                .map(|i| transitive_closure(i, &direct_deps, &mut cache, &canonical_index))
                 .collect()
         };
 
@@ -1001,6 +1056,11 @@ impl NixGenerator {
 
         for (i, unit) in graph.units.iter().enumerate() {
             if unit.mode == "run-custom-build" {
+                // Skip duplicate units - only process canonical indices
+                if canonical_index[i] != i {
+                    continue;
+                }
+
                 // This is a build script RUN unit - find its compile unit dependency
                 let compile_dep = unit.dependencies.iter().find(|dep| {
                     graph.units.get(dep.index).is_some_and(|u| {
@@ -1020,7 +1080,8 @@ impl NixGenerator {
                         build_script_runs.push(BuildScriptRunInfo {
                             unit_index: i,
                             package_name,
-                            compile_dep_index: compile_dep.index,
+                            // Use canonical index for compile dep
+                            compile_dep_index: canonical_index[compile_dep.index],
                             info,
                         });
                     }
@@ -1111,6 +1172,12 @@ impl NixGenerator {
         for (i, unit) in graph.units.iter().enumerate() {
             // Skip build script run units - they're already generated above
             if unit.mode == "run-custom-build" {
+                continue;
+            }
+
+            // Skip duplicate units - only generate for canonical indices
+            // Duplicates will reference the canonical unit's derivation via drv_names[i]
+            if canonical_index[i] != i {
                 continue;
             }
 
