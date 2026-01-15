@@ -102,7 +102,7 @@ features:
       - "@src/proc_macro.rs"
       - "@src/nix_gen.rs"
       - "@src/lib.rs"
-    status: pending
+    status: done
     block_count: 0
 
   # Phase 3: IFD Integration
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 10
+  done: 11
   blocked: 0
   total: 17

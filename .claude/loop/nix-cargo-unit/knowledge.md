@@ -498,3 +498,56 @@ Build scripts are identified by `unit.mode == "run-custom-build"`. When a regula
 
 ### Important: Build Scripts Are Not Extern Dependencies
 Build script execution units should NOT be added as `--extern` dependencies. They produce configuration, not linkable artifacts. The generated code correctly filters them out from the regular dependency wiring.
+
+## From feature #11
+
+### Proc-Macro Module
+`src/proc_macro.rs` handles proc-macro specific logic:
+- `ProcMacroInfo::from_unit()` - extracts proc-macro details from unit
+- `requires_host_toolchain(unit)` - returns true for proc-macros AND build scripts
+- `is_proc_macro_unit(unit)` - checks if unit is a proc-macro
+- `platform_library_extension(platform)` - returns `so`/`dylib`/`dll` based on platform
+
+### Host Toolchain for Cross-Compilation
+Proc-macros and build scripts must compile for the HOST platform:
+```rust
+if self.cross_compiling && crate::proc_macro::requires_host_toolchain(unit) {
+    "hostRustToolchain"
+} else {
+    "rustToolchain"
+}
+```
+
+### Generated Nix Function Signature
+With cross-compilation enabled:
+```nix
+{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:
+```
+Default `hostRustToolchain` to `rustToolchain` for native builds.
+
+### CLI Cross-Compilation Flags
+```bash
+nix-cargo-unit --cross-compile --host-platform aarch64-apple-darwin --target-platform x86_64-unknown-linux-gnu
+```
+
+### NixGenConfig Changes
+```rust
+pub struct NixGenConfig {
+    pub workspace_root: String,
+    pub content_addressed: bool,
+    pub cross_compiling: bool,      // New
+    pub target_platform: Option<String>,  // New
+    pub host_platform: Option<String>,    // New
+}
+```
+
+### UnitDerivation Changes
+Added `toolchain_var` field to store which toolchain to use (`rustToolchain` or `hostRustToolchain`).
+Added `is_proc_macro` field for tracking.
+
+### Platform Library Extensions
+- Linux/Unix: `.so`
+- macOS: `.dylib`
+- Windows: `.dll`
+
+Determined by `platform_library_extension(platform)` based on platform triple.
