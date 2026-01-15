@@ -603,3 +603,62 @@ in {
 The runCommand sets:
 - `CARGO_HOME` for cargo cache
 - `SSL_CERT_FILE` for crates.io downloads (uses `pkgs.cacert`)
+
+## From feature #13
+
+### Fileset-Based Source Filtering
+`nix/lib.nix` now provides source filtering using `lib.fileset.toSource`:
+- Reduces input hash by excluding non-Rust files (docs, CI configs, etc.)
+- Changes to irrelevant files don't invalidate builds
+
+### filterRustSource Function
+Filters a source tree to only Rust-relevant files:
+```nix
+filterRustSource {
+  src = ./.;
+  extraPaths = [ "proto" "assets" ];  # Optional extra paths to include
+}
+```
+
+Includes by default:
+- `Cargo.toml`, `Cargo.lock`
+- `src/`, `crates/`, `tests/`, `benches/`, `examples/`
+- `build.rs` at root
+- All `.rs` and `.toml` files (via fileFilter)
+
+### filterCrateSource Function
+More aggressive filtering for a single crate within a workspace:
+```nix
+filterCrateSource {
+  src = ./.;
+  cratePath = "crates/core";  # Relative path to crate
+}
+```
+
+Only includes:
+- Root `Cargo.toml` and `Cargo.lock`
+- The entire crate directory
+
+### buildWorkspace Source Filtering Parameters
+```nix
+buildWorkspace {
+  src = ./.;
+  filterSource = true;      # Enable filtering (default: true)
+  extraSourcePaths = [ ];   # Additional paths to include when filtering
+  # ...
+}
+```
+
+### filteredSrc in Output
+The filtered source is exposed in the output for debugging:
+```nix
+let result = cargoUnit.buildWorkspace { src = ./.; };
+in result.filteredSrc  # The filtered source derivation
+```
+
+### lib.fileset.maybeMissing
+Used for optional paths that may not exist:
+```nix
+optionalPath = path: lib.fileset.maybeMissing path;
+```
+Returns null for non-existent paths, which are filtered out before creating unions.

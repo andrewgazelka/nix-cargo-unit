@@ -659,11 +659,64 @@ impl NixGenerator {
 
         out.push_str(&format!("  roots = [ {} ];\n", root_refs.join(" ")));
 
+        // Packages attrset - maps package target name to derivation for workspace support
+        // This allows accessing individual workspace members by name
+        out.push_str("\n  # Workspace packages by target name\n");
+        out.push_str("  packages = {\n");
+        for &root_idx in &graph.roots {
+            if let Some(unit) = graph.units.get(root_idx) {
+                let target_name = &unit.target.name;
+                let drv_name = unit.derivation_name();
+                out.push_str(&format!(
+                    "    \"{}\" = units.\"{}\";\n",
+                    escape_nix_string(target_name),
+                    drv_name
+                ));
+            }
+        }
+        out.push_str("  };\n");
+
+        // Binaries attrset - only binary targets for convenient access
+        out.push_str("\n  # Binary targets only\n");
+        out.push_str("  binaries = {\n");
+        for &root_idx in &graph.roots {
+            if let Some(unit) = graph.units.get(root_idx) {
+                if unit.is_bin() {
+                    let target_name = &unit.target.name;
+                    let drv_name = unit.derivation_name();
+                    out.push_str(&format!(
+                        "    \"{}\" = units.\"{}\";\n",
+                        escape_nix_string(target_name),
+                        drv_name
+                    ));
+                }
+            }
+        }
+        out.push_str("  };\n");
+
+        // Libraries attrset - only library targets
+        out.push_str("\n  # Library targets only\n");
+        out.push_str("  libraries = {\n");
+        for &root_idx in &graph.roots {
+            if let Some(unit) = graph.units.get(root_idx) {
+                if unit.is_lib() || unit.is_proc_macro() {
+                    let target_name = &unit.target.name;
+                    let drv_name = unit.derivation_name();
+                    out.push_str(&format!(
+                        "    \"{}\" = units.\"{}\";\n",
+                        escape_nix_string(target_name),
+                        drv_name
+                    ));
+                }
+            }
+        }
+        out.push_str("  };\n");
+
         // Convenience: default is the first root
         if let Some(&first_root) = graph.roots.first() {
             if let Some(unit) = graph.units.get(first_root) {
                 out.push_str(&format!(
-                    "  default = units.\"{}\";\n",
+                    "\n  default = units.\"{}\";\n",
                     unit.derivation_name()
                 ));
             }
@@ -1341,5 +1394,105 @@ mod tests {
         // Should output to shared library path (.so)
         assert!(build_phase.contains("$out/lib/libmy_macro.so"));
         assert!(drv.is_proc_macro);
+    }
+
+    #[test]
+    fn test_workspace_packages_attrset() {
+        // Test workspace with multiple root units
+        let json = r#"{
+            "version": 1,
+            "units": [
+                {
+                    "pkg_id": "core-lib 0.1.0 (path+file:///workspace/crates/core)",
+                    "target": {
+                        "kind": ["lib"],
+                        "crate_types": ["lib"],
+                        "name": "core_lib",
+                        "src_path": "/workspace/crates/core/src/lib.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": []
+                },
+                {
+                    "pkg_id": "my-app 0.1.0 (path+file:///workspace/crates/app)",
+                    "target": {
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "name": "my_app",
+                        "src_path": "/workspace/crates/app/src/main.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "core_lib", "public": false}
+                    ]
+                },
+                {
+                    "pkg_id": "cli-tool 0.1.0 (path+file:///workspace/crates/cli)",
+                    "target": {
+                        "kind": ["bin"],
+                        "crate_types": ["bin"],
+                        "name": "cli_tool",
+                        "src_path": "/workspace/crates/cli/src/main.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": [],
+                    "mode": "build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "core_lib", "public": false}
+                    ]
+                }
+            ],
+            "roots": [0, 1, 2]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+        let config = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+            ..Default::default()
+        };
+
+        let generator = NixGenerator::new(config);
+        let nix = generator.generate(&graph);
+
+        // Should have packages attrset with all roots
+        assert!(nix.contains("packages = {"));
+        assert!(nix.contains("\"core_lib\" = units.\""));
+        assert!(nix.contains("\"my_app\" = units.\""));
+        assert!(nix.contains("\"cli_tool\" = units.\""));
+
+        // Should have binaries attrset with only binaries
+        assert!(nix.contains("binaries = {"));
+        // binaries should contain my_app and cli_tool but NOT core_lib
+        let binaries_section = nix
+            .split("# Binary targets only")
+            .nth(1)
+            .unwrap()
+            .split("# Library targets only")
+            .next()
+            .unwrap();
+        assert!(binaries_section.contains("\"my_app\""));
+        assert!(binaries_section.contains("\"cli_tool\""));
+        assert!(!binaries_section.contains("\"core_lib\""));
+
+        // Should have libraries attrset with only libraries
+        assert!(nix.contains("libraries = {"));
+        let libraries_section = nix.split("# Library targets only").nth(1).unwrap();
+        assert!(libraries_section.contains("\"core_lib\""));
+        // Libraries should NOT contain binaries
+        assert!(
+            !libraries_section
+                .split("default =")
+                .next()
+                .unwrap()
+                .contains("\"my_app\"")
+        );
     }
 }

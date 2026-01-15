@@ -120,7 +120,7 @@ features:
     depends_on: [12]
     relevant_files:
       - "@nix/lib.nix"
-    status: in_progress
+    status: done
     block_count: 0
 
   - id: 14
@@ -128,7 +128,7 @@ features:
     depends_on: [12]
     relevant_files:
       - "@nix/lib.nix"
-    status: pending
+    status: in_progress
     block_count: 0
 
   # Phase 4: Dynamic Derivations
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 12
+  done: 13
   blocked: 0
   total: 17

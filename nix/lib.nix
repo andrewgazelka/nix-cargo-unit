@@ -268,7 +268,19 @@ let
       # Root derivations (the final build targets)
       inherit (units) roots;
 
-      # Default output (typically the main binary/library)
+      # Workspace packages by target name (for multi-crate workspaces)
+      # Usage: result.packages.my-binary or result.packages."my-lib"
+      inherit (units) packages;
+
+      # Binary targets only (convenient for deployment)
+      # Usage: result.binaries.my-app
+      inherit (units) binaries;
+
+      # Library targets only
+      # Usage: result.libraries.my-lib
+      inherit (units) libraries;
+
+      # Default output (typically the first root unit)
       inherit (units) default;
 
       # Expose the intermediate derivations for debugging
@@ -289,6 +301,68 @@ let
     }@args:
     buildWorkspace args;
 
+  # Build a specific workspace member by package name
+  #
+  # This is more efficient than buildWorkspace when you only need one package,
+  # as cargo can skip building unrelated workspace members.
+  #
+  # Arguments:
+  #   src: Path to the cargo workspace
+  #   rustToolchain: Rust toolchain to use
+  #   package: Name of the package to build (as specified in Cargo.toml)
+  #   ... other buildWorkspace args
+  buildPackage =
+    {
+      src,
+      rustToolchain,
+      package,
+      cargoArgs ? "",
+      ...
+    }@args:
+    let
+      # Add -p flag to build only the specified package
+      packageArgs = "-p ${package} ${cargoArgs}";
+      result = buildWorkspace (args // { cargoArgs = packageArgs; });
+    in
+    result
+    // {
+      # Override default to be the requested package if it exists
+      default = result.packages.${package} or result.default;
+    };
+
+  # Build all binaries in a workspace
+  #
+  # Convenience function that builds all binary targets and returns them
+  # as an attrset.
+  buildBinaries =
+    {
+      src,
+      rustToolchain,
+      cargoArgs ? "",
+      ...
+    }@args:
+    let
+      # Use --bins to build all binaries
+      result = buildWorkspace (args // { cargoArgs = "--bins ${cargoArgs}"; });
+    in
+    result.binaries;
+
+  # Build all libraries in a workspace
+  #
+  # Convenience function that builds all library targets.
+  buildLibraries =
+    {
+      src,
+      rustToolchain,
+      cargoArgs ? "",
+      ...
+    }@args:
+    let
+      # Use --lib to build libraries
+      result = buildWorkspace (args // { cargoArgs = "--lib ${cargoArgs}"; });
+    in
+    result.libraries;
+
 in
 {
   inherit
@@ -296,6 +370,9 @@ in
     generateNixFromUnitGraph
     buildWorkspace
     buildCrate
+    buildPackage
+    buildBinaries
+    buildLibraries
     # Source filtering utilities
     filterRustSource
     filterCrateSource
