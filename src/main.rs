@@ -14,6 +14,10 @@ struct Cli {
     /// Workspace root path for source remapping
     #[arg(short, long, default_value = ".")]
     workspace_root: String,
+
+    /// Enable content-addressed derivations (CA-derivations)
+    #[arg(long)]
+    content_addressed: bool,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -31,7 +35,7 @@ fn main() -> color_eyre::Result<()> {
         "nix" => {
             let config = NixGenConfig {
                 workspace_root: cli.workspace_root,
-                content_addressed: false,
+                content_addressed: cli.content_addressed,
             };
             let generator = NixGenerator::new(config);
             let nix = generator.generate(&graph);

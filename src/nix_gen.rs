@@ -213,13 +213,17 @@ pub struct UnitDerivation {
 
     /// The rustc flags (precomputed).
     pub rustc_flags: RustcFlags,
+
+    /// Whether to use content-addressed derivations.
+    pub content_addressed: bool,
 }
 
 impl UnitDerivation {
     /// Creates a derivation builder from a unit.
     ///
     /// The `workspace_root` is used to remap absolute paths to Nix source paths.
-    pub fn from_unit(unit: &Unit, workspace_root: &str) -> Self {
+    /// The `content_addressed` flag enables CA-derivation attributes.
+    pub fn from_unit(unit: &Unit, workspace_root: &str, content_addressed: bool) -> Self {
         let name = unit.derivation_name();
         let pname = unit.target.name.clone();
         let version = unit.package_version().unwrap_or("0.0.0").to_string();
@@ -242,6 +246,7 @@ impl UnitDerivation {
             is_test: unit.is_test(),
             deps: Vec::new(),
             rustc_flags,
+            content_addressed,
         }
     }
 
@@ -266,6 +271,13 @@ impl UnitDerivation {
 
         // Native build inputs (rust toolchain)
         attrs.expr("nativeBuildInputs", "[ rustToolchain ]");
+
+        // Content-addressed derivation attributes
+        if self.content_addressed {
+            attrs.bool("__contentAddressed", true);
+            attrs.string("outputHashMode", "recursive");
+            attrs.string("outputHashAlgo", "sha256");
+        }
 
         // Build phase with rustc invocation
         let build_phase = self.generate_build_phase();
@@ -372,7 +384,11 @@ impl NixGenerator {
         out.push_str("  units = {\n");
 
         for (i, unit) in graph.units.iter().enumerate() {
-            let drv = UnitDerivation::from_unit(unit, &self.config.workspace_root);
+            let drv = UnitDerivation::from_unit(
+                unit,
+                &self.config.workspace_root,
+                self.config.content_addressed,
+            );
             let drv_name = &drv.name;
 
             out.push_str(&format!("    \"{}\" = mkUnit ", drv_name));
@@ -494,7 +510,7 @@ mod tests {
         let graph = parse_unit_graph(json);
         let unit = &graph.units[0];
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace");
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
 
         assert_eq!(drv.pname, "my_crate");
         assert_eq!(drv.version, "0.1.0");
@@ -627,7 +643,7 @@ mod tests {
         let graph = parse_unit_graph(json);
         let unit = &graph.units[0];
 
-        let drv = UnitDerivation::from_unit(unit, "/workspace");
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
         let build_phase = drv.generate_build_phase();
 
         // Check for proper flag formatting
@@ -640,5 +656,86 @@ mod tests {
         assert!(
             build_phase.contains("feature=\\\"std\\\"") || build_phase.contains("feature=\"std\"")
         );
+    }
+
+    #[test]
+    fn test_content_addressed_derivation() {
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///workspace)",
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "name": "test",
+                    "src_path": "/workspace/src/lib.rs",
+                    "edition": "2021"
+                },
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+        let unit = &graph.units[0];
+
+        // Without content-addressed
+        let drv = UnitDerivation::from_unit(unit, "/workspace", false);
+        let nix = drv.to_nix();
+        assert!(!nix.contains("__contentAddressed"));
+        assert!(!nix.contains("outputHashMode"));
+        assert!(!nix.contains("outputHashAlgo"));
+
+        // With content-addressed
+        let drv_ca = UnitDerivation::from_unit(unit, "/workspace", true);
+        let nix_ca = drv_ca.to_nix();
+        assert!(nix_ca.contains("__contentAddressed = true"));
+        assert!(nix_ca.contains("outputHashMode = \"recursive\""));
+        assert!(nix_ca.contains("outputHashAlgo = \"sha256\""));
+    }
+
+    #[test]
+    fn test_nix_generator_content_addressed() {
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "test 0.1.0 (path+file:///workspace)",
+                "target": {
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "name": "test",
+                    "src_path": "/workspace/src/lib.rs",
+                    "edition": "2024"
+                },
+                "profile": {"name": "dev", "opt_level": "0"},
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_unit_graph(json);
+
+        // Without CA
+        let config = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: false,
+        };
+        let nix = NixGenerator::new(config).generate(&graph);
+        assert!(!nix.contains("__contentAddressed"));
+
+        // With CA
+        let config_ca = NixGenConfig {
+            workspace_root: "/workspace".to_string(),
+            content_addressed: true,
+        };
+        let nix_ca = NixGenerator::new(config_ca).generate(&graph);
+        assert!(nix_ca.contains("__contentAddressed = true"));
+        assert!(nix_ca.contains("outputHashMode = \"recursive\""));
+        assert!(nix_ca.contains("outputHashAlgo = \"sha256\""));
     }
 }
