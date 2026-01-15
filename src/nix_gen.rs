@@ -246,8 +246,7 @@ impl NixAttrSet {
             result.push('"');
         }
         result.push_str(" ]");
-        self.attrs
-            .push((key.to_owned(), NixValue::Inline(result)));
+        self.attrs.push((key.to_owned(), NixValue::Inline(result)));
         self
     }
 
@@ -263,8 +262,7 @@ impl NixAttrSet {
             result.push_str(v);
         }
         result.push_str(" ]");
-        self.attrs
-            .push((key.to_owned(), NixValue::Inline(result)));
+        self.attrs.push((key.to_owned(), NixValue::Inline(result)));
         self
     }
 
@@ -298,11 +296,7 @@ impl NixAttrSet {
         let inner_indent = "  ".repeat(indent + 1);
 
         // Pre-allocate based on content size
-        let estimated_size: usize = self
-            .attrs
-            .iter()
-            .map(|(k, v)| k.len() + v.len() + 10)
-            .sum();
+        let estimated_size: usize = self.attrs.iter().map(|(k, v)| k.len() + v.len() + 10).sum();
         let mut out = String::with_capacity(estimated_size + 64);
         out.push_str("{\n");
 
@@ -454,8 +448,11 @@ impl UnitDerivation {
             crate::source_filter::remap_source_path(&unit.target.src_path, workspace_root, "src");
 
         let mut rustc_flags = RustcFlags::from_unit(unit);
-        // Add metadata hash for stable crate identity across compilations
-        rustc_flags.add_metadata(identity_hash);
+        // Add metadata hash for stable crate identity across compilations.
+        // Skip proc-macros: rustc rejects proc-macro dylibs with a forced metadata hash.
+        if !unit.is_proc_macro() {
+            rustc_flags.add_metadata(identity_hash);
+        }
 
         // Cap lints to warn for external dependencies (same as cargo does)
         // This prevents #[deny(dead_code)] etc from breaking dependency builds
@@ -575,7 +572,7 @@ impl UnitDerivation {
             script.push('\n');
         }
 
-        // Set up proc-macro path variables with platform fallback (before rustc command)
+        // Set up proc-macro path variables by locating the dylib in the output
         for dep in &self.deps {
             if dep.is_proc_macro {
                 let var_name = format!(
@@ -583,34 +580,16 @@ impl UnitDerivation {
                     dep.lib_name.to_uppercase().replace('-', "_")
                 );
                 script.push_str(&var_name);
-                script.push_str("=\"${");
+                script.push_str("=\"$(find ${");
                 script.push_str(&dep.nix_var);
-                script.push_str("}/lib/lib");
+                script.push_str("}/lib -type f -name 'lib");
                 script.push_str(&dep.lib_name);
-                script.push('-');
-                script.push_str(&dep.identity_hash);
-                script.push_str(".dylib\"\n");
-                script.push_str("[ -f \"$");
+                script.push_str(".*' -print -quit)\"\n");
+                script.push_str("[ -n \"$");
                 script.push_str(&var_name);
-                script.push_str("\" ] || ");
-                script.push_str(&var_name);
-                script.push_str("=\"${");
-                script.push_str(&dep.nix_var);
-                script.push_str("}/lib/lib");
+                script.push_str("\" ] || { echo \"Proc-macro not found: ");
                 script.push_str(&dep.lib_name);
-                script.push('-');
-                script.push_str(&dep.identity_hash);
-                script.push_str(".so\"\n");
-                // Debug: print the variable value
-                script.push_str("echo \"DEBUG: ");
-                script.push_str(&var_name);
-                script.push_str(" = $");
-                script.push_str(&var_name);
-                script.push_str("\" && ls -la \"$");
-                script.push_str(&var_name);
-                script.push_str("\" || echo \"File not found: $");
-                script.push_str(&var_name);
-                script.push_str("\"\n");
+                script.push_str("\"; exit 1; }\n");
             }
         }
 
@@ -1470,11 +1449,10 @@ mod tests {
         assert!(nix.contains("libserde-") && nix.contains(".rlib"));
 
         // Proc-macro dep should use variable with platform fallback
-        // Should have variable setup: PROCMACRO_SERDE_DERIVE="...dylib"
+        // Should have variable setup: PROCMACRO_SERDE_DERIVE="..."
         assert!(nix.contains("PROCMACRO_SERDE_DERIVE="));
-        // Should have .dylib and .so fallback
-        assert!(nix.contains("libserde_derive-") && nix.contains(".dylib"));
-        assert!(nix.contains("libserde_derive-") && nix.contains(".so"));
+        // Should locate proc-macro dylib via find
+        assert!(nix.contains("libserde_derive.*"));
         // Should use the variable in --extern: serde_derive="$PROCMACRO_SERDE_DERIVE"
         assert!(nix.contains("serde_derive=\"$PROCMACRO_SERDE_DERIVE\""));
     }

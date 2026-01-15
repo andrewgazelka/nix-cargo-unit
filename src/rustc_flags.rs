@@ -44,7 +44,7 @@ impl RustcFlags {
         flags.add_crate_types(&unit.target);
 
         // Profile-based codegen options
-        flags.add_profile_flags(&unit.profile);
+        flags.add_profile_flags(&unit.profile, &unit.target);
 
         // Features as --cfg
         flags.add_features(&unit.features);
@@ -88,15 +88,18 @@ impl RustcFlags {
     }
 
     /// Adds all profile-related codegen flags.
-    fn add_profile_flags(&mut self, profile: &Profile) {
+    fn add_profile_flags(&mut self, profile: &Profile, target: &Target) {
         // Optimization level
         self.push_codegen_flag("opt-level", &profile.opt_level);
 
         // Debug info
         self.add_debuginfo(profile.debuginfo);
 
-        // LTO
-        self.add_lto(&profile.lto);
+        // LTO - skip for proc-macros (rustc errors: "lto cannot be used for proc-macro crate type")
+        let is_proc_macro = target.crate_types.iter().any(|t| t == "proc-macro");
+        if !is_proc_macro {
+            self.add_lto(&profile.lto);
+        }
 
         // Codegen units
         if let Some(cgu) = profile.codegen_units {
@@ -538,5 +541,44 @@ mod tests {
         // Check proc-macro crate type
         let ct_idx = args.iter().position(|a| a == "--crate-type").unwrap();
         assert_eq!(args[ct_idx + 1], "proc-macro");
+    }
+
+    #[test]
+    fn test_proc_macro_no_lto() {
+        // LTO cannot be used with proc-macro crate type (rustc errors)
+        let json = r#"{
+            "version": 1,
+            "units": [{
+                "pkg_id": "my-macro 0.1.0 (path+file:///test)",
+                "target": {
+                    "kind": ["proc-macro"],
+                    "crate_types": ["proc-macro"],
+                    "name": "my_macro",
+                    "src_path": "/test/src/lib.rs",
+                    "edition": "2021"
+                },
+                "profile": {
+                    "name": "release",
+                    "opt_level": "3",
+                    "lto": "fat"
+                },
+                "features": [],
+                "mode": "build",
+                "dependencies": []
+            }],
+            "roots": [0]
+        }"#;
+
+        let graph = parse_test_unit_graph(json);
+        let unit = &graph.units[0];
+        let flags = RustcFlags::from_unit(unit);
+        let args = flags.args();
+
+        // LTO should NOT be present for proc-macros
+        assert!(
+            !args.iter().any(|a| a.contains("lto=")),
+            "proc-macro should not have LTO flag, got: {:?}",
+            args
+        );
     }
 }
