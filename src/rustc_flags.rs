@@ -54,11 +54,13 @@ impl RustcFlags {
             flags.push_arg("--test");
         }
 
-        // Allow mismatched_lifetime_syntaxes lint (Rust 1.89+)
-        // This lint errors on older crates that don't use explicit `'_` lifetimes.
-        // Allow it for compatibility with third-party crates on Rust nightly.
+        // Allow nightly lints that error on older crates for compatibility.
+        // mismatched_lifetime_syntaxes (Rust 1.89+): errors on crates without explicit `'_`
+        // dangerous_implicit_autorefs (Rust 1.89+): errors on raw pointer autorefs
         flags.push_arg("-A");
         flags.push_arg("mismatched_lifetime_syntaxes");
+        flags.push_arg("-A");
+        flags.push_arg("dangerous_implicit_autorefs");
 
         flags
     }
