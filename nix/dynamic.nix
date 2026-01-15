@@ -105,29 +105,57 @@ let
         else
           "packages";
 
+      # Script to create vendorDir from cargo registry
+      # Cargo downloads deps to $CARGO_HOME/registry/src/<index-hash>/crate-version/
+      # We copy files (not symlink) because child builds in recursive nix
+      # run in separate sandboxes and can't access parent's CARGO_HOME
+      createVendorDir = ''
+        mkdir -p vendor
+        for registry in "$CARGO_HOME"/registry/src/*/; do
+          if [ -d "$registry" ]; then
+            for crate in "$registry"*/; do
+              if [ -d "$crate" ]; then
+                cratename=$(basename "$crate")
+                cp -r "$crate" "vendor/$cratename"
+                chmod -R u+rw "vendor/$cratename"
+              fi
+            done
+          fi
+        done
+        VENDOR_DIR="$PWD/vendor"
+      '';
+
+      # Common nix-build args including vendorDir
+      nixBuildArgs = ''
+        --arg pkgs "import <nixpkgs> {}" \
+        --arg rustToolchain "$RUST_TOOLCHAIN_DRV" \
+        --arg hostRustToolchain "$HOST_RUST_TOOLCHAIN_DRV" \
+        --arg src "$PWD" \
+        --arg vendorDir "$VENDOR_DIR"'';
+
       # Script to build specific targets
       buildTargetsScript =
         if targets == [ "default" ] then
           ''
+            ${createVendorDir}
             # Build the default target
-            nix-build units.nix \
-              --arg pkgs "import <nixpkgs> {}" \
-              --arg rustToolchain "$RUST_TOOLCHAIN_DRV" \
-              --arg hostRustToolchain "$HOST_RUST_TOOLCHAIN_DRV" \
-              --arg src "$PWD" \
+            # Can't use -o $out inside store (forbidden GC root)
+            # Build to temp location and copy result
+            result=$(nix-build units.nix \
+              ${nixBuildArgs} \
               -A default \
-              -o $out
+              --no-out-link)
+            mkdir -p $out
+            cp -rL "$result"/* $out/
           ''
         else if targets == [ "all" ] then
           ''
+            ${createVendorDir}
             # Build all roots and symlink them
             mkdir -p $out/bin $out/lib
 
             for i in $(nix-instantiate units.nix \
-              --arg pkgs "import <nixpkgs> {}" \
-              --arg rustToolchain "$RUST_TOOLCHAIN_DRV" \
-              --arg hostRustToolchain "$HOST_RUST_TOOLCHAIN_DRV" \
-              --arg src "$PWD" \
+              ${nixBuildArgs} \
               -A roots --eval --json | jq -r '.[]'); do
               result=$(nix-build "$i")
               # Link outputs
@@ -145,15 +173,13 @@ let
           ''
         else
           ''
+            ${createVendorDir}
             # Build specific targets
             mkdir -p $out/bin $out/lib
 
             ${lib.concatMapStringsSep "\n" (target: ''
               result=$(nix-build units.nix \
-                --arg pkgs "import <nixpkgs> {}" \
-                --arg rustToolchain "$RUST_TOOLCHAIN_DRV" \
-                --arg hostRustToolchain "$HOST_RUST_TOOLCHAIN_DRV" \
-                --arg src "$PWD" \
+                ${nixBuildArgs} \
                 -A 'packages."${target}"')
               if [ -d "$result/bin" ]; then
                 for f in "$result/bin/"*; do

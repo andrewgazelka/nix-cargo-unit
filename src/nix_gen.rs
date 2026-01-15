@@ -716,9 +716,17 @@ impl UnitDerivation {
     esac
   done
   # Fix install_name for macOS dylibs (proc-macros) so they can be loaded from $out/lib
+  # Use absolute path - may not be in PATH in sandboxed builds.
   for dylib in $out/lib/*.dylib; do
-    [ -f "$dylib" ] && install_name_tool -id "$dylib" "$dylib" 2>/dev/null || true
+    [ -f "$dylib" ] && /usr/bin/install_name_tool -id "$dylib" "$dylib" 2>/dev/null || true
   done
+  # install_name_tool invalidates code signatures; re-sign or rustc dlopen fails.
+  # Use absolute path for codesign - it may not be in PATH in sandboxed builds.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    for dylib in $out/lib/*.dylib; do
+      [ -f "$dylib" ] && /usr/bin/codesign --force --sign - "$dylib"
+    done
+  fi
 }"#,
             );
         }
