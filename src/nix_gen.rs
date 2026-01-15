@@ -533,6 +533,35 @@ impl UnitDerivation {
             script.push('\n');
         }
 
+        // Set up proc-macro path variables with platform fallback (before rustc command)
+        for dep in &self.deps {
+            if dep.is_proc_macro {
+                let var_name = format!(
+                    "PROCMACRO_{}",
+                    dep.lib_name.to_uppercase().replace('-', "_")
+                );
+                script.push_str(&var_name);
+                script.push_str("=\"${");
+                script.push_str(&dep.nix_var);
+                script.push_str("}/lib/lib");
+                script.push_str(&dep.lib_name);
+                script.push('-');
+                script.push_str(&dep.identity_hash);
+                script.push_str(".dylib\"\n");
+                script.push_str("[ -f \"$");
+                script.push_str(&var_name);
+                script.push_str("\" ] || ");
+                script.push_str(&var_name);
+                script.push_str("=\"${");
+                script.push_str(&dep.nix_var);
+                script.push_str("}/lib/lib");
+                script.push_str(&dep.lib_name);
+                script.push('-');
+                script.push_str(&dep.identity_hash);
+                script.push_str(".so\"\n");
+            }
+        }
+
         script.push_str("rustc \\\n");
 
         // Add each flag on its own line for readability
@@ -570,20 +599,11 @@ impl UnitDerivation {
         for dep in &self.deps {
             script.push_str("  --extern ");
             if dep.is_proc_macro {
-                // Proc-macros are shared libraries (.so on Linux, .dylib on macOS)
-                // The filename includes the identity hash: lib{name}-{hash}.so/dylib
+                // Proc-macros use the variable set above
                 script.push_str(&dep.extern_crate_name);
-                script.push_str("=\"$(find ${");
-                script.push_str(&dep.nix_var);
-                script.push_str("}/lib -type f \\( -name 'lib");
-                script.push_str(&dep.lib_name);
-                script.push('-');
-                script.push_str(&dep.identity_hash);
-                script.push_str(".so' -o -name 'lib");
-                script.push_str(&dep.lib_name);
-                script.push('-');
-                script.push_str(&dep.identity_hash);
-                script.push_str(".dylib' \\) | head -1)\"");
+                script.push_str("=\"$PROCMACRO_");
+                script.push_str(&dep.lib_name.to_uppercase().replace('-', "_"));
+                script.push('"');
             } else {
                 // Regular dependencies use .rlib
                 script.push_str(&dep.extern_crate_name);
@@ -1374,8 +1394,14 @@ mod tests {
         // Regular lib dep should use .rlib (with identity hash in filename)
         assert!(nix.contains("libserde-") && nix.contains(".rlib"));
 
-        // Proc-macro dep should use find for dynamic lib
-        assert!(nix.contains("find") && nix.contains("serde_derive"));
+        // Proc-macro dep should use variable with platform fallback
+        // Should have variable setup: PROCMACRO_SERDE_DERIVE="...dylib"
+        assert!(nix.contains("PROCMACRO_SERDE_DERIVE="));
+        // Should have .dylib and .so fallback
+        assert!(nix.contains("libserde_derive-") && nix.contains(".dylib"));
+        assert!(nix.contains("libserde_derive-") && nix.contains(".so"));
+        // Should use the variable in --extern: serde_derive="$PROCMACRO_SERDE_DERIVE"
+        assert!(nix.contains("serde_derive=\"$PROCMACRO_SERDE_DERIVE\""));
     }
 
     #[test]

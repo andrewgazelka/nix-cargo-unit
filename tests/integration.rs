@@ -270,11 +270,11 @@ fn test_proc_macro_output_is_shared_library() {
     let nix = generator.generate(&graph);
 
     // Proc-macros should use --crate-type proc-macro which produces a shared library
-    // The extern references use find to locate the .so file
+    // The extern references use shell variable with platform fallback (.dylib/.so)
     assert!(
         nix.contains("--crate-type proc-macro")
-            || nix.contains("find") && nix.contains("libexample_macros"),
-        "proc-macro should use proc-macro crate type"
+            || nix.contains("PROCMACRO_EXAMPLE_MACROS=") && nix.contains("libexample_macros"),
+        "proc-macro should use proc-macro crate type or have PROCMACRO variable setup"
     );
 }
 
