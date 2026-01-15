@@ -837,28 +837,49 @@ impl NixGenerator {
         out.push_str("    dontConfigure = true;\n");
         out.push_str("  });\n\n");
 
-        // DEDUPLICATION: Units with the same logical identity (pkg_id, features, profile, mode,
-        // target, platform) should map to a single derivation. Build a mapping from unit index
-        // to "canonical" unit index (first occurrence of each unique logical identity).
+        // DEDUPLICATION: Units with the same (pkg_id, target_name, mode) should map to a single
+        // derivation, even if they have different features. Build a mapping from unit index
+        // to "canonical" unit index.
         //
-        // This is necessary because Cargo's unit graph can contain duplicate entries for the
-        // same logical unit when it appears through different dependency paths. Without
-        // deduplication, each occurrence gets a different identity hash (because dependency
-        // indices differ), leading to multiple derivations for the same crate. This causes
-        // rustc SVH mismatches at compile time.
+        // This is necessary because Cargo's unit graph can contain multiple entries for the
+        // same crate with different feature sets (e.g., serde_core with features [alloc, std]
+        // vs [alloc, default, rc, std]). Without deduplication, each feature set gets a
+        // different identity hash, cascading through the dependency tree and causing rustc
+        // SVH mismatches at compile time.
+        //
+        // Strategy: For units with the same (pkg_id, target_name, mode), pick the one with
+        // the most features as canonical. This ensures all code sees a superset of features.
         let canonical_index: Vec<usize> = {
-            let mut identity_to_canonical: rustc_hash::FxHashMap<String, usize> =
+            // Key: (pkg_id, target_name, mode) - ignores features for deduplication
+            let mut key_to_candidates: rustc_hash::FxHashMap<(String, String, String), Vec<usize>> =
                 rustc_hash::FxHashMap::default();
-            graph
-                .units
-                .iter()
-                .enumerate()
-                .map(|(idx, unit)| {
-                    // Use identity_hash() WITHOUT deps as the logical identity key
-                    let key = unit.identity_hash();
-                    *identity_to_canonical.entry(key).or_insert(idx)
-                })
-                .collect()
+
+            // Collect all units with the same key
+            for (idx, unit) in graph.units.iter().enumerate() {
+                let key = (
+                    unit.pkg_id.clone(),
+                    unit.target.name.clone(),
+                    unit.mode.clone(),
+                );
+                key_to_candidates.entry(key).or_default().push(idx);
+            }
+
+            // For each group, pick the unit with the most features as canonical
+            let mut idx_to_canonical: Vec<usize> = vec![0; graph.units.len()];
+            for candidates in key_to_candidates.values() {
+                // Find the candidate with the most features
+                let canonical_idx = *candidates
+                    .iter()
+                    .max_by_key(|&&idx| graph.units[idx].features.len())
+                    .unwrap();
+
+                // Map all candidates to the canonical one
+                for &idx in candidates {
+                    idx_to_canonical[idx] = canonical_idx;
+                }
+            }
+
+            idx_to_canonical
         };
 
         // Pre-compute identity hashes and derivation names for all units (needed for dependency resolution)
