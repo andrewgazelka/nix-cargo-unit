@@ -74,7 +74,7 @@ features:
       - "@src/build_script.rs"
       - "@src/nix_gen.rs"
       - "@src/lib.rs"
-    status: in_progress
+    status: done
     block_count: 0
 
   - id: 9
@@ -82,7 +82,7 @@ features:
     depends_on: [8]
     relevant_files:
       - "@src/build_script.rs"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 10
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 7
+  done: 8
   blocked: 0
   total: 17

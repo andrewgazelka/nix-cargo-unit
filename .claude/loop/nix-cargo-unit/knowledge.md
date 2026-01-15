@@ -12,7 +12,7 @@ Workers read this FIRST before exploring.
 | `@src/rustc_flags.rs` | RustcFlags builder - generates rustc CLI args from unit metadata |
 | `@src/source_filter.rs` | Source location parsing, path remapping, Nix fileset generation |
 | `@src/nix_gen.rs` | Structured Nix derivation builder with proper escaping |
-| `@src/build_script.rs` | Build script handling (to be created) |
+| `@src/build_script.rs` | Build script detection, compile/run derivation generation |
 | `@src/proc_macro.rs` | Proc-macro host compilation (to be created) |
 | `@flake.nix` | Nix flake with packages, devShells, overlays |
 | `@nix/lib.nix` | Nix library for IFD-based builds (to be created) |
@@ -373,3 +373,52 @@ Use `find` to locate the correct file since extension varies by platform.
 Build phase creates the correct output directory:
 - `mkdir -p $out/bin` for binaries
 - `mkdir -p $out/lib` for libraries/proc-macros
+
+## From feature #8
+
+### Build Script Detection
+`BuildScriptInfo::from_unit(&unit, workspace_root, content_addressed)` detects build scripts via:
+- `unit.mode == "run-custom-build"` - execution phase
+- `unit.target.kind.contains("custom-build")` - compilation target
+
+Helper functions:
+```rust
+is_build_script_unit(unit)    // Either mode or kind
+is_build_script_run(unit)     // mode == "run-custom-build"
+is_build_script_compile(unit) // kind contains "custom-build"
+```
+
+### Two-Derivation Model
+Build scripts produce two derivations:
+1. **Compile derivation** (`{pkg}-build-script-{version}-{hash}`):
+   - Compiles build.rs to `$out/bin/build-script`
+   - Uses standard rustc flags from unit
+
+2. **Run derivation** (`{pkg}-build-script-run-{version}-{hash}`):
+   - Depends on compile derivation
+   - Sets cargo environment (OUT_DIR, CARGO_PKG_*, CARGO_FEATURE_*)
+   - Executes binary, parses stdout for `cargo:` directives
+   - Outputs structured files: `$out/rustc-cfg`, `$out/rustc-link-lib`, etc.
+
+### Build Script Environment
+Run derivation sets these env vars:
+- `OUT_DIR=$out/out-dir` - for generated files
+- `CARGO_MANIFEST_DIR`, `CARGO_PKG_NAME`, `CARGO_PKG_VERSION`
+- `CARGO_FEATURE_{FEATURE}=1` for each enabled feature (uppercase, hyphens to underscores)
+- `TARGET`, `HOST`, `PROFILE`
+
+### Parsed Cargo Directives
+Run derivation parses these directives to files:
+- `cargo:rustc-cfg=...` -> `$out/rustc-cfg` (one per line)
+- `cargo:rustc-link-lib=...` -> `$out/rustc-link-lib`
+- `cargo:rustc-link-search=...` -> `$out/rustc-link-search`
+- `cargo:rustc-env=...` -> `$out/rustc-env` (KEY=VALUE per line)
+- `cargo:rustc-cdylib-link-arg=...` -> `$out/rustc-cdylib-link-arg`
+- `cargo:warning=...` -> stderr
+- `cargo:rerun-if-*` -> ignored (CA handles cache invalidation)
+
+### RustcFlags now Clone
+`RustcFlags` derives `Clone` to support `BuildScriptInfo::Clone`.
+
+### escape_nix_multiline is public
+`nix_gen::escape_nix_multiline(s)` is now public for use by build_script module.
