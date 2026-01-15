@@ -662,3 +662,79 @@ Used for optional paths that may not exist:
 optionalPath = path: lib.fileset.maybeMissing path;
 ```
 Returns null for non-existent paths, which are filtered out before creating unions.
+
+## From feature #14
+
+### Workspace Support - Generated Output Attrsets
+The generated Nix now includes three attrsets for workspace support:
+
+1. **packages** - All root units by target name:
+```nix
+packages = {
+  "my_lib" = units."my_lib-0.1.0-abc123";
+  "my_app" = units."my_app-0.1.0-def456";
+};
+```
+
+2. **binaries** - Only binary targets:
+```nix
+binaries = {
+  "my_app" = units."my_app-0.1.0-def456";
+};
+```
+
+3. **libraries** - Only library/proc-macro targets:
+```nix
+libraries = {
+  "my_lib" = units."my_lib-0.1.0-abc123";
+};
+```
+
+### Nix Library Functions for Workspaces
+
+`buildPackage` - Build a specific workspace member:
+```nix
+cargoUnit.buildPackage {
+  src = ./.;
+  rustToolchain = pkgs.rust-bin.nightly.latest.default;
+  package = "my-app";  # Cargo package name
+}
+```
+This adds `-p my-app` to cargo, building only that package.
+
+`buildBinaries` - Build all binaries in workspace:
+```nix
+cargoUnit.buildBinaries {
+  src = ./.;
+  rustToolchain = ...;
+}
+# Returns: { my_app = <drv>; cli_tool = <drv>; }
+```
+
+`buildLibraries` - Build all libraries in workspace:
+```nix
+cargoUnit.buildLibraries {
+  src = ./.;
+  rustToolchain = ...;
+}
+# Returns: { core_lib = <drv>; utils = <drv>; }
+```
+
+### Accessing Workspace Members
+```nix
+let
+  result = cargoUnit.buildWorkspace { src = ./.; ... };
+in {
+  # All roots
+  inherit (result) roots;
+
+  # Specific package by name
+  app = result.packages.my_app;
+
+  # All binaries for deployment
+  binaries = result.binaries;
+
+  # Default (first root)
+  default = result.default;
+}
+```

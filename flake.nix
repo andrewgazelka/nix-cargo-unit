@@ -62,5 +62,24 @@
         inherit pkgs;
         nix-cargo-unit = self.packages.${pkgs.system}.default;
       };
+
+    # Dynamic derivations library (no IFD, uses recursive-nix)
+    # Requires: experimental-features = dynamic-derivations ca-derivations recursive-nix
+    # Usage: nix-cargo-unit.libDynamic.<system> { src = ./.; rustToolchain = ...; }
+    libDynamic = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system}.extend self.overlays.default;
+    in
+      import ./nix/dynamic.nix {
+        inherit pkgs;
+        nix-cargo-unit = self.packages.${system}.default;
+      });
+
+    # Convenience function to create the dynamic library for any pkgs
+    # Usage: nix-cargo-unit.mkLibDynamic pkgs
+    mkLibDynamic = pkgs:
+      import ./nix/dynamic.nix {
+        inherit pkgs;
+        nix-cargo-unit = self.packages.${pkgs.system}.default;
+      };
   };
 }

@@ -128,7 +128,7 @@ features:
     depends_on: [12]
     relevant_files:
       - "@nix/lib.nix"
-    status: in_progress
+    status: done
     block_count: 0
 
   # Phase 4: Dynamic Derivations
@@ -138,7 +138,7 @@ features:
     relevant_files:
       - "@nix/dynamic.nix"
       - "@flake.nix"
-    status: pending
+    status: in_progress
     block_count: 0
 
   # Phase 4b: Testing and Validation
@@ -164,6 +164,6 @@ features:
     block_count: 0
 
 progress:
-  done: 13
+  done: 14
   blocked: 0
   total: 17
