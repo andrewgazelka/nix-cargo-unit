@@ -48,10 +48,36 @@ CA derivations fail on macOS due to code signing ([NixOS/nix#6065](https://githu
 
 ## How it works
 
-1. Runs `cargo build --unit-graph` to get the compilation DAG
-2. Generates a Nix derivation for each unit with proper `--extern` and `-L` flags
-3. Wires build script outputs (`cargo:rustc-cfg`, etc.) to dependent units
-4. Compiles proc-macros for the host platform
+```mermaid
+flowchart LR
+    subgraph Input
+        src[Cargo workspace]
+    end
+
+    subgraph Analysis
+        src --> unitgraph[cargo build --unit-graph]
+        unitgraph --> dag[Unit DAG]
+    end
+
+    subgraph "Nix Derivations"
+        dag --> gen[Generate per-unit derivations]
+        gen --> build["build.rs units"]
+        gen --> proc["proc-macro units"]
+        gen --> lib["lib/bin units"]
+
+        build -->|cargo:rustc-cfg| lib
+        proc -->|--extern| lib
+    end
+
+    subgraph Output
+        lib --> bins[Final binaries]
+    end
+```
+
+1. **Analysis**: Runs `cargo build --unit-graph` to extract the compilation DAG
+2. **Generation**: Creates a Nix derivation per unit with `--extern` and `-L` flags
+3. **Wiring**: Build script outputs (`cargo:rustc-cfg`, etc.) flow to dependent units
+4. **Host compilation**: Proc-macros compile for host platform, libraries for target
 
 ## Example
 
