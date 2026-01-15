@@ -23,17 +23,12 @@
   in {
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
-
-      # Nightly toolchain required for --unit-graph
-      rustToolchain = pkgs.rust-bin.nightly.latest.default;
-
-      # Get the nix-cargo-unit library
       cargoUnit = nix-cargo-unit.mkLib pkgs;
 
       # Build the entire workspace using nix-cargo-unit
+      # rustVersion auto-read from rust-toolchain.toml
       workspace = cargoUnit.buildWorkspace {
         src = ./.;
-        inherit rustToolchain;
         # Enable CA-derivations for content-addressed outputs
         contentAddressed = true;
         # Default release profile
@@ -57,13 +52,12 @@
     # Dev shell for working on the example
     devShells = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
-      rustToolchain = pkgs.rust-bin.nightly.latest.default.override {
-        extensions = ["rust-src" "rust-analyzer"];
-      };
     in {
       default = pkgs.mkShell {
         packages = [
-          rustToolchain
+          (pkgs.rust-bin.nightly."2026-01-14".default.override {
+            extensions = ["rust-src" "rust-analyzer"];
+          })
           pkgs.cargo-watch
         ];
       };
@@ -72,13 +66,11 @@
     # Checks to validate the workspace builds correctly
     checks = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system}.extend rust-overlay.overlays.default;
-      rustToolchain = pkgs.rust-bin.nightly.latest.default;
       cargoUnit = nix-cargo-unit.mkLib pkgs;
 
+      # rustVersion auto-read from rust-toolchain.toml, contentAddressed defaults to true
       workspace = cargoUnit.buildWorkspace {
         src = ./.;
-        inherit rustToolchain;
-        contentAddressed = true;
       };
     in {
       # Test that the app binary runs correctly

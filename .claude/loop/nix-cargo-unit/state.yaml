@@ -138,7 +138,7 @@ features:
     relevant_files:
       - "@nix/dynamic.nix"
       - "@flake.nix"
-    status: in_progress
+    status: done
     block_count: 0
 
   # Phase 4b: Testing and Validation
@@ -148,7 +148,7 @@ features:
     relevant_files:
       - "@tests/integration.rs"
       - "@Cargo.toml"
-    status: pending
+    status: done
     block_count: 0
 
   - id: 17
@@ -160,10 +160,10 @@ features:
       - "@examples/workspace/crates/macros/src/lib.rs"
       - "@examples/workspace/crates/app/src/main.rs"
       - "@examples/workspace/crates/app/build.rs"
-    status: pending
+    status: done
     block_count: 0
 
 progress:
-  done: 14
+  done: 17
   blocked: 0
   total: 17

@@ -15,7 +15,7 @@
 //! The run derivation outputs structured files that [`BuildScriptOutput`] can parse
 //! to generate the appropriate rustc flags.
 
-use crate::nix_gen::NixAttrSet;
+use crate::nix_gen::{NixAttrSet, generate_cargo_pkg_exports};
 use crate::rustc_flags::RustcFlags;
 use crate::unit_graph::Unit;
 
@@ -264,8 +264,16 @@ pub struct BuildScriptInfo {
     /// Package version.
     pub version: String,
 
+    /// The target name (e.g., "build-script-build").
+    /// Used to locate the compiled binary in the compile derivation.
+    pub target_name: String,
+
     /// The source path to build.rs (remapped for Nix).
     pub src_path: String,
+
+    /// The manifest directory (CARGO_MANIFEST_DIR), remapped for Nix.
+    /// This is the directory containing Cargo.toml for this crate.
+    pub manifest_dir: String,
 
     /// Unique derivation name for the compiled build script binary.
     pub compile_drv_name: String,
@@ -294,10 +302,15 @@ impl BuildScriptInfo {
 
         let package_name = unit.package_name().to_string();
         let version = unit.package_version().unwrap_or("0.0.0").to_string();
+        let target_name = unit.target.name.clone();
 
         // Remap source path
         let src_path =
             crate::source_filter::remap_source_path(&unit.target.src_path, workspace_root, "src");
+
+        // Remap manifest directory (CARGO_MANIFEST_DIR)
+        let manifest_dir =
+            crate::source_filter::remap_manifest_dir(unit, workspace_root, "src", "vendorDir");
 
         // Generate unique derivation names
         let base_hash = unit.identity_hash();
@@ -309,7 +322,9 @@ impl BuildScriptInfo {
         Some(Self {
             package_name,
             version,
+            target_name,
             src_path,
+            manifest_dir,
             compile_drv_name,
             run_drv_name,
             rustc_flags,
@@ -327,7 +342,10 @@ impl BuildScriptInfo {
         attrs.string("pname", &format!("{}-build-script", self.package_name));
         attrs.string("version", &self.version);
         attrs.expr("buildInputs", "[]");
-        attrs.expr("nativeBuildInputs", "[ rustToolchain ]");
+        attrs.expr(
+            "nativeBuildInputs",
+            "[ rustToolchain ] ++ extraNativeBuildInputs",
+        );
 
         if self.content_addressed {
             attrs.bool("__contentAddressed", true);
@@ -354,39 +372,11 @@ impl BuildScriptInfo {
         script.push_str("mkdir -p build\n\n");
 
         // Set Cargo environment variables that build scripts may use via env!() at compile time
-        script.push_str("# Cargo environment variables for env!() macros\n");
-        script.push_str(&format!(
-            "export CARGO_PKG_NAME=\"{}\"\n",
-            self.package_name
+        script.push_str(&generate_cargo_pkg_exports(
+            &self.package_name,
+            &self.version,
+            &self.features,
         ));
-        script.push_str(&format!("export CARGO_PKG_VERSION=\"{}\"\n", self.version));
-
-        // Parse version components
-        let version_parts: Vec<&str> = self.version.split('.').collect();
-        let major = version_parts.first().unwrap_or(&"0");
-        let minor = version_parts.get(1).unwrap_or(&"0");
-        let patch_full = version_parts.get(2).unwrap_or(&"0");
-        // Strip any pre-release suffix from patch (e.g., "0-alpha" -> "0")
-        let patch = patch_full.split('-').next().unwrap_or("0");
-
-        script.push_str(&format!("export CARGO_PKG_VERSION_MAJOR=\"{}\"\n", major));
-        script.push_str(&format!("export CARGO_PKG_VERSION_MINOR=\"{}\"\n", minor));
-        script.push_str(&format!("export CARGO_PKG_VERSION_PATCH=\"{}\"\n", patch));
-        script.push_str("export CARGO_PKG_VERSION_PRE=\"\"\n");
-        script.push_str("export CARGO_PKG_AUTHORS=\"\"\n");
-        script.push_str("export CARGO_PKG_DESCRIPTION=\"\"\n");
-        script.push_str("export CARGO_PKG_HOMEPAGE=\"\"\n");
-        script.push_str("export CARGO_PKG_REPOSITORY=\"\"\n");
-        script.push_str("export CARGO_PKG_LICENSE=\"\"\n");
-        script.push_str("export CARGO_PKG_LICENSE_FILE=\"\"\n");
-        script.push_str("export CARGO_PKG_RUST_VERSION=\"\"\n");
-        script.push_str("export CARGO_PKG_README=\"\"\n");
-
-        // Set feature flags as environment variables
-        for feature in &self.features {
-            let env_name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
-            script.push_str(&format!("export {env_name}=1\n"));
-        }
 
         script.push_str("\nrustc \\\n");
 
@@ -432,7 +422,12 @@ impl BuildScriptInfo {
 
         // Depend on the compiled build script
         attrs.expr("buildInputs", &format!("[ {} ]", compile_drv_var));
-        attrs.expr("nativeBuildInputs", "[]");
+        // Include rustToolchain for build scripts that query rustc (e.g., rustversion)
+        // and extraNativeBuildInputs for tools like protoc that run during build script execution
+        attrs.expr(
+            "nativeBuildInputs",
+            "[ rustToolchain ] ++ extraNativeBuildInputs",
+        );
 
         if self.content_addressed {
             attrs.bool("__contentAddressed", true);
@@ -459,31 +454,109 @@ impl BuildScriptInfo {
 
         // Set up environment variables that build scripts expect
         script.push_str("export OUT_DIR=$out/out-dir\n");
-        script.push_str(&format!(
-            "export CARGO_MANIFEST_DIR=${{src}}/{}\n",
-            self.package_name
-        ));
-        script.push_str(&format!(
-            "export CARGO_PKG_NAME=\"{}\"\n",
-            self.package_name
-        ));
-        script.push_str(&format!("export CARGO_PKG_VERSION=\"{}\"\n", self.version));
 
-        // Set feature flags as environment variables
-        for feature in &self.features {
-            let env_name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
-            script.push_str(&format!("export {env_name}=1\n"));
-        }
+        // CARGO_MANIFEST_DIR is the directory containing Cargo.toml for this crate
+        // This is pre-computed with proper remapping for workspace vs vendored crates
+        script.push_str(&format!(
+            "export CARGO_MANIFEST_DIR=\"{}\"\n",
+            self.manifest_dir
+        ));
 
-        // Target info (hardcoded for now, should come from config)
-        script.push_str("export TARGET=\"$system\"\n");
-        script.push_str("export HOST=\"$system\"\n");
+        // Set Cargo package environment variables
+        script.push_str(&generate_cargo_pkg_exports(
+            &self.package_name,
+            &self.version,
+            &self.features,
+        ));
+
+        // Rust compiler and target info
+        // Map Nix system names to Rust target triples
+        script.push_str("export RUSTC=\"$(type -p rustc)\"\n");
+        script.push_str(
+            r#"case "$system" in
+  aarch64-darwin)
+    TARGET="aarch64-apple-darwin"
+    CARGO_CFG_TARGET_ARCH="aarch64"
+    CARGO_CFG_TARGET_OS="macos"
+    CARGO_CFG_TARGET_FAMILY="unix"
+    CARGO_CFG_TARGET_VENDOR="apple"
+    CARGO_CFG_TARGET_ENV=""
+    CARGO_CFG_TARGET_POINTER_WIDTH="64"
+    CARGO_CFG_TARGET_ENDIAN="little"
+    CARGO_CFG_UNIX=""
+    ;;
+  x86_64-darwin)
+    TARGET="x86_64-apple-darwin"
+    CARGO_CFG_TARGET_ARCH="x86_64"
+    CARGO_CFG_TARGET_OS="macos"
+    CARGO_CFG_TARGET_FAMILY="unix"
+    CARGO_CFG_TARGET_VENDOR="apple"
+    CARGO_CFG_TARGET_ENV=""
+    CARGO_CFG_TARGET_POINTER_WIDTH="64"
+    CARGO_CFG_TARGET_ENDIAN="little"
+    CARGO_CFG_UNIX=""
+    ;;
+  aarch64-linux)
+    TARGET="aarch64-unknown-linux-gnu"
+    CARGO_CFG_TARGET_ARCH="aarch64"
+    CARGO_CFG_TARGET_OS="linux"
+    CARGO_CFG_TARGET_FAMILY="unix"
+    CARGO_CFG_TARGET_VENDOR="unknown"
+    CARGO_CFG_TARGET_ENV="gnu"
+    CARGO_CFG_TARGET_POINTER_WIDTH="64"
+    CARGO_CFG_TARGET_ENDIAN="little"
+    CARGO_CFG_UNIX=""
+    ;;
+  x86_64-linux)
+    TARGET="x86_64-unknown-linux-gnu"
+    CARGO_CFG_TARGET_ARCH="x86_64"
+    CARGO_CFG_TARGET_OS="linux"
+    CARGO_CFG_TARGET_FAMILY="unix"
+    CARGO_CFG_TARGET_VENDOR="unknown"
+    CARGO_CFG_TARGET_ENV="gnu"
+    CARGO_CFG_TARGET_POINTER_WIDTH="64"
+    CARGO_CFG_TARGET_ENDIAN="little"
+    CARGO_CFG_UNIX=""
+    ;;
+  *)
+    TARGET="$system"
+    CARGO_CFG_TARGET_ARCH=""
+    CARGO_CFG_TARGET_OS=""
+    CARGO_CFG_TARGET_FAMILY=""
+    CARGO_CFG_TARGET_VENDOR=""
+    CARGO_CFG_TARGET_ENV=""
+    CARGO_CFG_TARGET_POINTER_WIDTH=""
+    CARGO_CFG_TARGET_ENDIAN=""
+    ;;
+esac
+export TARGET HOST="$TARGET"
+export CARGO_CFG_TARGET_ARCH CARGO_CFG_TARGET_OS CARGO_CFG_TARGET_FAMILY
+export CARGO_CFG_TARGET_VENDOR CARGO_CFG_TARGET_ENV
+export CARGO_CFG_TARGET_POINTER_WIDTH CARGO_CFG_TARGET_ENDIAN
+export CARGO_CFG_UNIX
+"#,
+        );
         script.push_str("export PROFILE=\"release\"\n");
+        // Add DEBUG and OPT_LEVEL for build scripts that check optimization settings
+        script.push_str("export DEBUG=\"false\"\n");
+        script.push_str("export OPT_LEVEL=\"3\"\n");
 
         // Run the build script and capture output
+        // The binary name matches the target name (typically "build-script-build")
+        // Use a temporary file to avoid pipefail issues with failing build scripts
+        // NOTE: We cd to CARGO_MANIFEST_DIR because some build scripts read Cargo.toml
+        // from the current directory rather than from CARGO_MANIFEST_DIR env var
         script.push_str(&format!(
-            "\n# Run build script and parse output\n{}/bin/build-script 2>&1 | while IFS= read -r line; do\n",
-            compile_drv_var
+            "\n# Run build script from package directory (some read Cargo.toml from cwd)\n\
+            cd \"$CARGO_MANIFEST_DIR\"\n\
+            BUILD_SCRIPT_OUTPUT=$(mktemp)\n\
+            set +e\n\
+            {}/bin/{} > \"$BUILD_SCRIPT_OUTPUT\" 2>&1\n\
+            BUILD_SCRIPT_EXIT=$?\n\
+            set -e\n\n\
+            # Parse cargo directives from output\n\
+            while IFS= read -r line; do\n",
+            compile_drv_var, self.target_name
         ));
 
         // Parse cargo: directives
@@ -515,10 +588,22 @@ impl BuildScriptInfo {
       echo "Unknown cargo directive: $line" >&2
       ;;
   esac
-done
+done < "$BUILD_SCRIPT_OUTPUT"
 
 # Create empty files if they don't exist (for consistent interface)
 touch $out/rustc-cfg $out/rustc-link-lib $out/rustc-link-search $out/rustc-env
+
+# Exit with build script's exit code only if it actually failed
+if [ $BUILD_SCRIPT_EXIT -ne 0 ]; then
+  echo "Build script exited with code $BUILD_SCRIPT_EXIT" >&2
+  echo "=== Build script output ===" >&2
+  cat "$BUILD_SCRIPT_OUTPUT" >&2
+  echo "=== End build script output ===" >&2
+  rm -f "$BUILD_SCRIPT_OUTPUT"
+  exit $BUILD_SCRIPT_EXIT
+fi
+
+rm -f "$BUILD_SCRIPT_OUTPUT"
 "#;
         script.push_str(parse_script);
 

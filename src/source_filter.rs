@@ -161,13 +161,31 @@ impl SourceLocation {
 
 /// Parses a pkg_id into (name, version, source_type).
 ///
-/// Format: `"name version (source)"`
+/// Supports two formats:
+/// - Old format: `"name version (source)"`
+/// - New format: `"source#name@version"`
+///
 /// Examples:
-/// - `"serde 1.0.219 (registry+https://github.com/rust-lang/crates.io-index)"`
+/// - `"serde 1.0.219 (registry+https://github.com/rust-lang/crates.io-index)"` (old)
+/// - `"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.219"` (new)
 /// - `"my-crate 0.1.0 (path+file:///home/user/project)"`
-/// - `"dep 0.1.0 (git+https://github.com/user/repo?rev=abc#abc123)"`
+/// - `"path+file:///home/user/project#my-crate@0.1.0"`
 fn parse_pkg_id(pkg_id: &str) -> Option<(String, String, SourceType)> {
-    // Split into "name version" and "(source)"
+    // Try new format first: "source#name@version"
+    if let Some(hash_pos) = pkg_id.find('#') {
+        let source_str = &pkg_id[..hash_pos];
+        let name_version = &pkg_id[hash_pos + 1..];
+
+        // Parse name@version
+        if let Some(at_pos) = name_version.find('@') {
+            let name = name_version[..at_pos].to_string();
+            let version = name_version[at_pos + 1..].to_string();
+            let source = parse_source_type(source_str)?;
+            return Some((name, version, source));
+        }
+    }
+
+    // Try old format: "name version (source)"
     let paren_start = pkg_id.find('(')?;
     let paren_end = pkg_id.rfind(')')?;
 
@@ -305,12 +323,88 @@ pub fn make_relative(workspace_root: &str, absolute_path: &str) -> Option<String
 /// * `workspace_root` - The workspace root path
 /// * `nix_src_var` - The Nix variable containing the source (e.g., `src` or `${src}`)
 pub fn remap_source_path(src_path: &str, workspace_root: &str, nix_src_var: &str) -> String {
+    // First, try remapping to workspace source
     if let Some(relative) = make_relative(workspace_root, src_path) {
-        format!("${{{nix_src_var}}}/{relative}")
-    } else {
-        // Fallback: use the original path (might fail in Nix sandbox)
-        src_path.to_string()
+        return format!("${{{nix_src_var}}}/{relative}");
     }
+
+    // Try to detect and remap registry crate paths
+    // Pattern: /.cargo/registry/src/index.crates.io-xxxxx/cratename-version/...
+    if let Some(remapped) = remap_registry_path(src_path) {
+        return remapped;
+    }
+
+    // Fallback: use the original path (might fail in Nix sandbox)
+    src_path.to_string()
+}
+
+/// Remaps a unit's manifest directory (CARGO_MANIFEST_DIR) to Nix paths.
+///
+/// For workspace/local crates: Returns `${src}` or `${src}/relative/path`
+/// For registry crates: Returns `${vendorDir}/cratename-version`
+///
+/// # Arguments
+/// * `unit` - The cargo unit to get manifest dir for
+/// * `workspace_root` - The workspace root path
+/// * `nix_src_var` - Nix variable for workspace source (e.g., "src")
+/// * `nix_vendor_var` - Nix variable for vendored crates (e.g., "vendorDir")
+pub fn remap_manifest_dir(
+    unit: &Unit,
+    workspace_root: &str,
+    nix_src_var: &str,
+    nix_vendor_var: &str,
+) -> String {
+    let source_loc = SourceLocation::from_unit(unit);
+
+    match source_loc {
+        Some(loc) if loc.is_registry() => {
+            // Registry crates: ${vendorDir}/cratename-version
+            format!("${{{}}}/{}-{}", nix_vendor_var, loc.name, loc.version)
+        }
+        Some(loc) if loc.is_path() => {
+            // Workspace/local crates: compute relative path from crate_root
+            if let Some(relative) = make_relative(workspace_root, &loc.crate_root) {
+                if relative.is_empty() {
+                    // Root crate - just ${src}
+                    format!("${{{}}}", nix_src_var)
+                } else {
+                    format!("${{{}}}/{}", nix_src_var, relative)
+                }
+            } else {
+                // Fallback to just ${src}
+                format!("${{{}}}", nix_src_var)
+            }
+        }
+        _ => {
+            // Fallback: just ${src}
+            format!("${{{}}}", nix_src_var)
+        }
+    }
+}
+
+/// Attempts to remap a cargo registry path to vendorDir.
+///
+/// Registry paths look like:
+/// `/home/user/.cargo/registry/src/index.crates.io-1234567890abcdef/cratename-1.2.3/src/lib.rs`
+///
+/// These get remapped to:
+/// `${vendorDir}/cratename-1.2.3/src/lib.rs`
+fn remap_registry_path(src_path: &str) -> Option<String> {
+    // Look for registry/src/ in the path
+    let registry_marker = "/registry/src/";
+    let registry_pos = src_path.find(registry_marker)?;
+
+    // Skip to after registry/src/
+    let after_registry = &src_path[registry_pos + registry_marker.len()..];
+
+    // The next component is the index hash (e.g., index.crates.io-1234567890abcdef)
+    // Skip it to get to cratename-version
+    let slash_pos = after_registry.find('/')?;
+    let remainder = &after_registry[slash_pos + 1..];
+
+    // remainder is now: cratename-version/src/lib.rs
+    // We want to remap to: ${vendorDir}/cratename-version/src/lib.rs
+    Some(format!("${{vendorDir}}/{remainder}"))
 }
 
 #[cfg(test)]
@@ -344,6 +438,32 @@ mod tests {
             source,
             SourceType::Registry { url } if url == "https://github.com/rust-lang/crates.io-index"
         ));
+    }
+
+    #[test]
+    fn test_parse_registry_pkg_id_new_format() {
+        // New cargo format: "source#name@version"
+        let (name, version, source) =
+            parse_pkg_id("registry+https://github.com/rust-lang/crates.io-index#httparse@1.10.1")
+                .unwrap();
+
+        assert_eq!(name, "httparse");
+        assert_eq!(version, "1.10.1");
+        assert!(matches!(
+            source,
+            SourceType::Registry { url } if url == "https://github.com/rust-lang/crates.io-index"
+        ));
+    }
+
+    #[test]
+    fn test_parse_path_pkg_id_new_format() {
+        // New cargo format for path sources
+        let (name, version, source) =
+            parse_pkg_id("path+file:///home/user/project#my-crate@0.1.0").unwrap();
+
+        assert_eq!(name, "my-crate");
+        assert_eq!(version, "0.1.0");
+        assert!(matches!(source, SourceType::Path { path } if path == "/home/user/project"));
     }
 
     #[test]

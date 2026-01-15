@@ -1,0 +1,15 @@
+[package]
+name = "tonic-proto-example"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tonic-proto-example"
+path = "src/main.rs"
+
+[dependencies]
+prost = "0.13"
+tonic = "0.12"
+
+[build-dependencies]
+tonic-build = "0.12"

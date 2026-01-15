@@ -9,8 +9,8 @@
 #   in
 #     cargoUnit.buildWorkspace {
 #       src = ./.;
-#       # Optional: override the rust toolchain
-#       rustToolchain = pkgs.rust-bin.stable.latest.default;
+#       # Required: pinned Rust version (e.g., "1.84.0" or "nightly-2026-01-14")
+#       rustVersion = "nightly-2026-01-14";
 #     }
 {
   pkgs,
@@ -18,6 +18,102 @@
 }:
 let
   inherit (pkgs) lib;
+
+  # Read and validate rust version from rust-toolchain.toml
+  #
+  # Parses rust-toolchain.toml and extracts the channel.
+  # Validates that the channel is precisely pinned (not floating).
+  #
+  # Arguments:
+  #   src: Path to the source tree containing rust-toolchain.toml
+  #
+  # Returns: The validated version string (e.g., "nightly-2026-01-14" or "1.84.0")
+  #
+  # Throws if:
+  #   - rust-toolchain.toml doesn't exist
+  #   - Channel is not precisely pinned (e.g., "nightly" without date)
+  readRustVersion =
+    src:
+    let
+      toolchainFile = src + "/rust-toolchain.toml";
+      hasFile = builtins.pathExists toolchainFile;
+      contents = if hasFile then builtins.readFile toolchainFile else null;
+      parsed = if contents != null then builtins.fromTOML contents else null;
+      channel = if parsed != null then parsed.toolchain.channel or null else null;
+
+      # Validate the channel is precisely pinned
+      isStable = channel != null && builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" channel != null;
+      isNightlyPinned = channel != null && builtins.match "nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}" channel != null;
+      isBetaPinned = channel != null && builtins.match "beta-[0-9]{4}-[0-9]{2}-[0-9]{2}" channel != null;
+      isPinned = isStable || isNightlyPinned || isBetaPinned;
+    in
+    if !hasFile then
+      throw ''
+        nix-cargo-unit requires a rust-toolchain.toml file in the source root.
+
+        Create one with a pinned Rust version:
+          [toolchain]
+          channel = "nightly-2026-01-14"  # or "1.84.0" for stable
+      ''
+    else if channel == null then
+      throw ''
+        rust-toolchain.toml must contain [toolchain].channel
+
+        Example:
+          [toolchain]
+          channel = "nightly-2026-01-14"
+      ''
+    else if !isPinned then
+      throw ''
+        rust-toolchain.toml channel must be precisely pinned.
+
+        Found: "${channel}"
+
+        Valid formats:
+          - Stable: "1.84.0" (specific version number)
+          - Nightly: "nightly-2026-01-14" (with specific date)
+          - Beta: "beta-2026-01-14" (with specific date)
+
+        Invalid formats:
+          - "nightly" (no date - floating)
+          - "stable" (no version - floating)
+          - "beta" (no date - floating)
+
+        This requirement ensures reproducible builds.
+      ''
+    else
+      channel;
+
+  # Create a rust toolchain from a pinned version string
+  #
+  # Parses version strings like:
+  #   - "1.84.0" -> pkgs.rust-bin.stable."1.84.0".default
+  #   - "nightly-2026-01-14" -> pkgs.rust-bin.nightly."2026-01-14".default
+  #   - "beta-2026-01-14" -> pkgs.rust-bin.beta."2026-01-14".default
+  #
+  # This requires rust-overlay to be applied to pkgs.
+  toolchainFromVersion =
+    version:
+    let
+      nightlyMatch = builtins.match "nightly-([0-9]{4}-[0-9]{2}-[0-9]{2})" version;
+      betaMatch = builtins.match "beta-([0-9]{4}-[0-9]{2}-[0-9]{2})" version;
+      isStable = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" version != null;
+    in
+    if nightlyMatch != null then
+      pkgs.rust-bin.nightly.${builtins.elemAt nightlyMatch 0}.default
+    else if betaMatch != null then
+      pkgs.rust-bin.beta.${builtins.elemAt betaMatch 0}.default
+    else if isStable then
+      pkgs.rust-bin.stable.${version}.default
+    else
+      throw ''
+        Invalid rustVersion format: "${version}"
+
+        Expected formats:
+          - Stable: "1.84.0"
+          - Nightly: "nightly-2026-01-14"
+          - Beta: "beta-2026-01-14"
+      '';
 
   # Filter source to only include Rust-relevant files using lib.fileset
   #
@@ -125,20 +221,42 @@ let
       rustToolchain,
       cargoArgs ? "",
       profile ? "release",
+      vendorDir ? null,
     }:
     pkgs.runCommand "unit-graph.json"
       {
         nativeBuildInputs = [
           rustToolchain
-          pkgs.cacert # For fetching crates
+          pkgs.cacert # For fetching crates (if not vendored)
         ];
 
-        # Environment for cargo
-        CARGO_HOME = "$TMPDIR/cargo-home";
+        # SSL cert for downloading crates
         SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       }
       ''
-        mkdir -p $CARGO_HOME
+        # Set up cargo home in the temp directory (must expand $TMPDIR in shell)
+        export CARGO_HOME="$TMPDIR/cargo-home"
+        mkdir -p "$CARGO_HOME"
+
+        ${lib.optionalString (vendorDir != null) ''
+        # Configure cargo to use vendored dependencies
+        # The .cargo/config.toml from importCargoLock has the git source replacements
+        # but uses a relative path. We need to fix it to use the absolute nix store path.
+        if [ -f "${vendorDir}/.cargo/config.toml" ]; then
+          # Copy and fix the directory path to be absolute
+          sed 's|directory = "cargo-vendor-dir"|directory = "${vendorDir}"|' \
+            "${vendorDir}/.cargo/config.toml" > "$CARGO_HOME/config.toml"
+        else
+          cat > "$CARGO_HOME/config.toml" << EOF
+        [source.crates-io]
+        replace-with = "vendored-sources"
+
+        [source.vendored-sources]
+        directory = "${vendorDir}"
+        EOF
+        fi
+        ''}
+
         cd ${src}
 
         # Generate unit graph
@@ -148,8 +266,9 @@ let
           --unit-graph \
           -Z unstable-options \
           ${lib.optionalString (profile == "release") "--release"} \
+          ${lib.optionalString (vendorDir != null) "--offline"} \
           ${cargoArgs} \
-          2>/dev/null > $out
+          > $out
       '';
 
   # Convert unit graph JSON to Nix derivations using nix-cargo-unit
@@ -184,6 +303,53 @@ let
         nix-cargo-unit ${flags} < ${unitGraphJson} > $out
       '';
 
+  # Validate that a Rust version string is precisely pinned (not floating)
+  #
+  # Valid examples:
+  #   - "1.84.0" (stable version)
+  #   - "nightly-2026-01-14" (nightly with date)
+  #   - "beta-2026-01-14" (beta with date)
+  #
+  # Invalid examples:
+  #   - "latest" (floating)
+  #   - "nightly" (floating, no date)
+  #   - "stable" (floating)
+  #
+  assertPinnedRustVersion =
+    version:
+    let
+      # Stable versions: X.Y.Z format
+      isStableVersion = builtins.match "[0-9]+\\.[0-9]+\\.[0-9]+" version != null;
+      # Nightly/beta with date: channel-YYYY-MM-DD format
+      isChannelWithDate = builtins.match "(nightly|beta)-[0-9]{4}-[0-9]{2}-[0-9]{2}" version != null;
+      isPinned = isStableVersion || isChannelWithDate;
+    in
+    if !isPinned then
+      throw ''
+        nix-cargo-unit requires a precisely pinned Rust version.
+
+        You provided: "${version}"
+
+        Valid formats:
+          - Stable: "1.84.0" (specific version number)
+          - Nightly: "nightly-2026-01-14" (with specific date)
+          - Beta: "beta-2026-01-14" (with specific date)
+
+        Invalid formats:
+          - "latest", "stable", "nightly", "beta" (floating versions)
+
+        This requirement ensures reproducible builds and prevents ABI
+        incompatibility between cached crates compiled with different
+        compiler versions.
+
+        Example usage with rust-overlay:
+          rustToolchain = pkgs.rust-bin.stable."1.84.0".default;
+          # or
+          rustToolchain = pkgs.rust-bin.nightly."2026-01-14".default;
+      ''
+    else
+      true;
+
   # Build a Rust workspace using IFD
   #
   # This is the main entry point. It:
@@ -192,8 +358,10 @@ let
   # 3. Imports the generated Nix (IFD) and builds the workspace
   #
   # Arguments:
-  #   src: Path to the cargo workspace
-  #   rustToolchain: Rust toolchain to use (must be nightly for unit-graph)
+  #   src: Path to the cargo workspace (must contain rust-toolchain.toml with pinned version)
+  #   rustVersion: Optional - Override version from rust-toolchain.toml
+  #                If not provided, reads from rust-toolchain.toml (MUST be pinned)
+  #   rustToolchain: Optional - Custom toolchain derivation. If not provided, derived from rustVersion.
   #   hostRustToolchain: Host toolchain for proc-macros in cross-compilation
   #   profile: Build profile ("release" or "dev")
   #   cargoArgs: Additional args to pass to cargo
@@ -206,7 +374,9 @@ let
   buildWorkspace =
     {
       src,
-      rustToolchain,
+      # Auto-read from rust-toolchain.toml if not provided
+      rustVersion ? readRustVersion src,
+      rustToolchain ? toolchainFromVersion rustVersion,
       hostRustToolchain ? rustToolchain,
       profile ? "release",
       cargoArgs ? "",
@@ -216,8 +386,18 @@ let
       targetPlatform ? null,
       filterSource ? true,
       extraSourcePaths ? [ ],
+      # Extra native build inputs for build scripts (e.g., protobuf, cmake)
+      nativeBuildInputs ? [ ],
+      # Path to Cargo.lock for vendoring external deps
+      # If not provided, will try src/Cargo.lock
+      cargoLock ? null,
+      # Output hashes for git dependencies (passed to importCargoLock)
+      outputHashes ? { },
     }:
     let
+      # Validate that the Rust version is precisely pinned
+      _ = assertPinnedRustVersion rustVersion;
+
       # Apply source filtering if enabled
       # This reduces the input hash by excluding non-Rust files
       filteredSrc =
@@ -229,11 +409,23 @@ let
         else
           src;
 
+      # Vendor dependencies if Cargo.lock is available
+      # This creates a directory with all crates from crates.io/git
+      lockFile = if cargoLock != null then cargoLock else (src + "/Cargo.lock");
+      hasLockFile = builtins.pathExists lockFile;
+      vendorDir =
+        if hasLockFile then
+          pkgs.rustPlatform.importCargoLock {
+            inherit lockFile outputHashes;
+          }
+        else
+          null;
+
       # Step 1: Generate unit graph JSON (IFD step 1)
       # Use filtered source for unit graph generation
       unitGraphJson = generateUnitGraph {
         src = filteredSrc;
-        inherit rustToolchain cargoArgs profile;
+        inherit rustToolchain cargoArgs profile vendorDir;
       };
 
       # Get the absolute workspace root path as a string for source remapping
@@ -256,9 +448,10 @@ let
       # This is where the magic happens - Nix evaluates a derivation output
       # Pass filtered source to the generated derivations
       units = import unitsNix {
-        inherit pkgs rustToolchain;
+        inherit pkgs rustToolchain vendorDir;
         inherit hostRustToolchain;
         src = filteredSrc;
+        extraNativeBuildInputs = nativeBuildInputs;
       };
     in
     {
@@ -288,6 +481,9 @@ let
 
       # Expose the filtered source for inspection
       inherit filteredSrc;
+
+      # Expose vendor directory for debugging
+      inherit vendorDir;
     };
 
   # Build a single crate (non-workspace) using IFD

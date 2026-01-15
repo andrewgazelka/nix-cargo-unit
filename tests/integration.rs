@@ -124,7 +124,7 @@ fn test_nix_generation_produces_valid_structure() {
 
     // Check Nix structure
     assert!(
-        nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"),
+        nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src, extraNativeBuildInputs ? [], vendorDir ? null }:"),
         "missing function signature"
     );
     assert!(nix.contains("let"), "missing let block");
@@ -319,10 +319,10 @@ fn test_library_output_is_rlib() {
     let generator = nix_cargo_unit::nix_gen::NixGenerator::new(config);
     let nix = generator.generate(&graph);
 
-    // Libraries should output to .rlib
+    // Libraries should output to .rlib (with identity hash in filename)
     assert!(
-        nix.contains("libexample_core.rlib"),
-        "library should output to .rlib file"
+        nix.contains("libexample_core-") && nix.contains(".rlib"),
+        "library should output to .rlib file with identity hash"
     );
 }
 

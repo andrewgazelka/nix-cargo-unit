@@ -54,6 +54,12 @@ impl RustcFlags {
             flags.push_arg("--test");
         }
 
+        // Allow mismatched_lifetime_syntaxes lint (Rust 1.89+)
+        // This lint errors on older crates that don't use explicit `'_` lifetimes.
+        // Allow it for compatibility with third-party crates on Rust nightly.
+        flags.push_arg("-A");
+        flags.push_arg("mismatched_lifetime_syntaxes");
+
         flags
     }
 
@@ -175,6 +181,18 @@ impl RustcFlags {
             self.push_arg("--cfg");
             self.push_arg(&format!("feature=\"{feature}\""));
         }
+    }
+
+    /// Adds metadata hash and extra filename for stable crate identity.
+    ///
+    /// This is critical for ensuring crates can find their dependencies across
+    /// separate compilation units. Without this, rustc may generate different
+    /// StableCrateId values for the same crate, causing "can't find crate" errors.
+    ///
+    /// This generates: `-C metadata=HASH -C extra-filename=-HASH`
+    pub fn add_metadata(&mut self, hash: &str) {
+        self.push_codegen_flag("metadata", hash);
+        self.push_codegen_flag("extra-filename", &format!("-{hash}"));
     }
 
     /// Adds an extern crate reference.

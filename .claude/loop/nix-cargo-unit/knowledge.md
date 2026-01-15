@@ -738,3 +738,178 @@ in {
   default = result.default;
 }
 ```
+
+## From feature #15
+
+### Dynamic Derivations Mode
+`nix/dynamic.nix` provides an alternative to IFD using recursive Nix:
+- No evaluation-time blocking on builds
+- Works in restricted evaluation mode (Hydra, etc.)
+- Requires: `experimental-features = dynamic-derivations ca-derivations recursive-nix`
+
+### buildWorkspaceDynamic
+Main entry point for dynamic derivation builds:
+```nix
+let
+  cargoUnit = nix-cargo-unit.mkLibDynamic pkgs;
+in
+  cargoUnit.buildWorkspaceDynamic {
+    src = ./.;
+    rustToolchain = pkgs.rust-bin.nightly.latest.default;
+    targets = [ "default" ];  # or [ "all" ] or [ "pkg1" "pkg2" ]
+  }
+```
+
+### Target Selection
+The `targets` parameter controls what gets built:
+- `[ "default" ]` - Build only the default target (first root)
+- `[ "all" ]` - Build all roots, link outputs into $out/bin and $out/lib
+- `[ "pkg1" "pkg2" ]` - Build specific packages by name
+
+### __structuredAttrs
+Dynamic derivations use `__structuredAttrs = true` for better handling of complex attributes. This enables JSON-based attribute passing to the build script.
+
+### Recursive Nix
+The build phase uses recursive nix-build to instantiate and build the generated Nix expressions:
+```bash
+nix-build units.nix --arg pkgs "import <nixpkgs> {}" -A default -o $out
+```
+
+### requiredSystemFeatures
+The derivation specifies `requiredSystemFeatures = [ "recursive-nix" ]` to ensure it only runs on builders with recursive Nix enabled.
+
+### Flake Access
+```nix
+# Pre-configured for each system
+nix-cargo-unit.libDynamic.${system}.buildWorkspaceDynamic { ... }
+
+# Create for any pkgs
+nix-cargo-unit.mkLibDynamic pkgs
+```
+
+### Key Differences from IFD Mode
+| Aspect | IFD (`lib.nix`) | Dynamic (`dynamic.nix`) |
+|--------|-----------------|-------------------------|
+| Eval blocking | Yes | No |
+| Restricted eval | Blocked | Works |
+| Cache granularity | Per-unit | Single derivation |
+| Nix features | None required | recursive-nix, ca-derivations |
+| Debugging | Intermediate files available | All in one derivation |
+
+## From feature #17
+
+### Example Workspace Structure
+`examples/workspace/` demonstrates end-to-end nix-cargo-unit functionality:
+```
+examples/workspace/
+  Cargo.toml           # Workspace manifest (resolver = "3")
+  Cargo.lock           # Lockfile for reproducibility
+  flake.nix            # Uses nix-cargo-unit.mkLib to build
+  README.md            # Usage documentation
+  crates/
+    core/              # Library with build.rs
+      Cargo.toml
+      build.rs         # Emits cargo:rustc-cfg, generates code
+      src/lib.rs       # Uses #[cfg(has_build_script)], include!(OUT_DIR)
+    macros/            # Proc-macro crate
+      Cargo.toml       # [lib] proc-macro = true
+      src/lib.rs       # Derive, function-like, attribute macros
+    app/               # Binary using both
+      Cargo.toml
+      build.rs         # Own build script with OUT_DIR code gen
+      src/main.rs      # Uses both core and macros
+```
+
+### Build Script check-cfg
+To avoid `unexpected_cfgs` warnings, build scripts must declare expected cfgs:
+```rust
+// In build.rs
+println!("cargo::rustc-check-cfg=cfg(has_build_script)");
+println!("cargo::rustc-check-cfg=cfg(build_profile, values(\"release\", \"dev\"))");
+```
+
+### StripSetting New Format
+Cargo's unit-graph now uses a structured format for strip:
+```json
+"strip": {"resolved": {"Named": "debuginfo"}}
+```
+Previously it was just `"strip": "debuginfo"` or `"strip": true`.
+
+The `StripSetting` deserializer now handles:
+- Boolean: `true` -> Symbols, `false` -> None
+- String: `"none"`, `"debuginfo"`, `"symbols"`
+- Map: `{"resolved": {"Named": "debuginfo"}}` or `{"resolved": "None"}`
+
+### Example Flake Pattern
+The example flake shows how consumers use nix-cargo-unit:
+```nix
+let
+  cargoUnit = nix-cargo-unit.mkLib pkgs;
+  workspace = cargoUnit.buildWorkspace {
+    src = ./.;
+    rustToolchain = pkgs.rust-bin.nightly.latest.default;
+    contentAddressed = true;
+    profile = "release";
+  };
+in {
+  default = workspace.default;
+  example-app = workspace.packages.example-app or workspace.binaries.example-app;
+  # Debug outputs
+  unit-graph-json = workspace.unitGraphJson;
+  units-nix = workspace.unitsNix;
+}
+```
+
+### Testing the Example
+```bash
+# With cargo
+cd examples/workspace && cargo build && cargo run
+
+# Generate unit graph
+cargo +nightly build --unit-graph -Z unstable-options --release 2>/dev/null | nix-cargo-unit -w . --content-addressed
+
+# With nix (requires IFD)
+cd examples/workspace && nix build
+```
+
+## From feature #16
+
+### Integration Tests Location
+`tests/integration.rs` - integration tests using the example workspace.
+
+### Running Integration Tests
+```bash
+cargo nextest run --test integration
+```
+Tests require nightly rust for `cargo --unit-graph`.
+
+### Test Helper Pattern
+```rust
+fn get_unit_graph() -> String {
+    let output = std::process::Command::new("cargo")
+        .args(["+nightly", "build", "--unit-graph", "-Z", "unstable-options", "--release"])
+        .current_dir("examples/workspace")
+        .output()
+        .expect("failed to run cargo");
+    String::from_utf8(output.stdout).expect("invalid UTF-8")
+}
+
+fn parse_unit_graph(json: &str) -> nix_cargo_unit::unit_graph::UnitGraph {
+    serde_json::from_str(json).expect("failed to parse")
+}
+```
+
+### Integration Test Coverage
+- `test_example_workspace_unit_graph_parses` - basic JSON parsing
+- `test_example_workspace_has_build_scripts` - build.rs detection
+- `test_example_workspace_has_proc_macro` - proc-macro detection
+- `test_nix_generation_produces_valid_structure` - Nix output structure
+- `test_nix_generation_has_example_derivations` - specific derivations
+- `test_nix_generation_has_dependency_wiring` - --extern and -L flags
+- `test_unit_identity_hashes_are_unique` - no duplicate derivation names
+- `test_proc_macro_output_is_shared_library` - .so output for proc-macros
+- `test_binary_output_is_in_bin_dir` - $out/bin/ for binaries
+- `test_library_output_is_rlib` - .rlib output for libraries
+- `test_rustc_flags_include_edition` - --edition flag
+- `test_source_paths_are_remapped` - ${src} variable
+- `test_workspace_outputs_map_targets` - packages/binaries/libraries attrsets

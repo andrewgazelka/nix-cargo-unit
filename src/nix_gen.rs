@@ -5,6 +5,76 @@
 //! and producing readable output.
 
 use crate::build_script::{BuildScriptInfo, BuildScriptOutput};
+
+/// Parsed version components from a semver string.
+#[derive(Debug, Clone)]
+pub struct VersionParts<'a> {
+    pub major: &'a str,
+    pub minor: &'a str,
+    pub patch: &'a str,
+}
+
+impl<'a> VersionParts<'a> {
+    /// Parses version components from a version string like "1.2.3" or "1.2.3-alpha".
+    pub fn parse(version: &'a str) -> Self {
+        let parts: Vec<&str> = version.split('.').collect();
+        let major = parts.first().copied().unwrap_or("0");
+        let minor = parts.get(1).copied().unwrap_or("0");
+        let patch_full = parts.get(2).copied().unwrap_or("0");
+        // Strip any pre-release suffix from patch (e.g., "0-alpha" -> "0")
+        let patch = patch_full.split('-').next().unwrap_or("0");
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+/// Generates shell script exports for CARGO_PKG_* environment variables.
+///
+/// These are needed by crates that use `env!()` macros at compile time.
+pub fn generate_cargo_pkg_exports(
+    package_name: &str,
+    version: &str,
+    features: &[String],
+) -> String {
+    let mut script = String::new();
+    let vp = VersionParts::parse(version);
+
+    script.push_str("# Cargo package environment variables for env!() macros\n");
+    script.push_str(&format!("export CARGO_PKG_NAME=\"{}\"\n", package_name));
+    script.push_str(&format!("export CARGO_PKG_VERSION=\"{}\"\n", version));
+    script.push_str(&format!(
+        "export CARGO_PKG_VERSION_MAJOR=\"{}\"\n",
+        vp.major
+    ));
+    script.push_str(&format!(
+        "export CARGO_PKG_VERSION_MINOR=\"{}\"\n",
+        vp.minor
+    ));
+    script.push_str(&format!(
+        "export CARGO_PKG_VERSION_PATCH=\"{}\"\n",
+        vp.patch
+    ));
+    script.push_str("export CARGO_PKG_VERSION_PRE=\"\"\n");
+    script.push_str("export CARGO_PKG_AUTHORS=\"\"\n");
+    script.push_str("export CARGO_PKG_DESCRIPTION=\"\"\n");
+    script.push_str("export CARGO_PKG_HOMEPAGE=\"\"\n");
+    script.push_str("export CARGO_PKG_REPOSITORY=\"\"\n");
+    script.push_str("export CARGO_PKG_LICENSE=\"\"\n");
+    script.push_str("export CARGO_PKG_LICENSE_FILE=\"\"\n");
+    script.push_str("export CARGO_PKG_RUST_VERSION=\"\"\n");
+    script.push_str("export CARGO_PKG_README=\"\"\n");
+
+    // Set feature flags as environment variables
+    for feature in features {
+        let env_name = format!("CARGO_FEATURE_{}", feature.to_uppercase().replace('-', "_"));
+        script.push_str(&format!("export {env_name}=1\n"));
+    }
+
+    script
+}
 use crate::rustc_flags::RustcFlags;
 use crate::unit_graph::{Unit, UnitGraph};
 
@@ -199,7 +269,16 @@ pub struct DepRef {
     pub nix_var: String,
 
     /// Extern crate name (used in --extern flag).
+    /// This is the alias name (e.g., `libc_errno` when `errno` is renamed).
     pub extern_crate_name: String,
+
+    /// Library name (used for constructing path to .rlib file).
+    /// This is the actual crate library name as it appears on disk (e.g., `errno`).
+    pub lib_name: String,
+
+    /// Identity hash of the dependency (used in -C extra-filename suffix).
+    /// The library file is named `lib{lib_name}-{identity_hash}.rlib`.
+    pub identity_hash: String,
 
     /// Derivation name (for reference).
     pub derivation_name: String,
@@ -254,8 +333,12 @@ pub struct UnitDerivation {
     /// Whether this is a proc-macro.
     pub is_proc_macro: bool,
 
-    /// Dependencies with extern crate info.
+    /// Dependencies with extern crate info (direct deps only - used for --extern).
     pub deps: Vec<DepRef>,
+
+    /// Library search paths (transitive deps - used for -L dependency=).
+    /// Tuple of (nix_var, lib_name) - e.g., ("units.\"foo-1.0.0-hash\"", "foo")
+    pub lib_search_deps: Vec<(String, String)>,
 
     /// Build script outputs this unit depends on (if any).
     pub build_script_ref: Option<BuildScriptRef>,
@@ -291,7 +374,9 @@ impl UnitDerivation {
         let src_path =
             crate::source_filter::remap_source_path(&unit.target.src_path, workspace_root, "src");
 
-        let rustc_flags = RustcFlags::from_unit(unit);
+        let mut rustc_flags = RustcFlags::from_unit(unit);
+        // Add metadata hash for stable crate identity across compilations
+        rustc_flags.add_metadata(&unit.identity_hash());
 
         Self {
             name,
@@ -305,6 +390,7 @@ impl UnitDerivation {
             is_test: unit.is_test(),
             is_proc_macro: unit.is_proc_macro(),
             deps: Vec::new(),
+            lib_search_deps: Vec::new(),
             build_script_ref: None,
             rustc_flags,
             content_addressed,
@@ -320,6 +406,11 @@ impl UnitDerivation {
     /// Adds a dependency reference with extern crate info.
     pub fn add_dep(&mut self, dep_ref: DepRef) {
         self.deps.push(dep_ref);
+    }
+
+    /// Sets the library search dependencies (transitive deps for -L flags).
+    pub fn set_lib_search_deps(&mut self, deps: Vec<(String, String)>) {
+        self.lib_search_deps = deps;
     }
 
     /// Generates the Nix derivation expression.
@@ -377,7 +468,15 @@ impl UnitDerivation {
         script.push_str("mkdir -p build\n");
 
         // Initialize build script flags variable
-        script.push_str("BUILD_SCRIPT_FLAGS=\"\"\n");
+        script.push_str("BUILD_SCRIPT_FLAGS=\"\"\n\n");
+
+        // Set CARGO_PKG_* environment variables that crates may use via env!() at compile time
+        script.push_str(&generate_cargo_pkg_exports(
+            &self.pname,
+            &self.version,
+            &self.features,
+        ));
+        script.push('\n');
 
         // Read build script outputs if this unit depends on a build script
         if let Some(ref bs_ref) = self.build_script_ref {
@@ -404,37 +503,56 @@ impl UnitDerivation {
             script.push_str(" \\\n");
         }
 
-        // Add -L library search paths for all dependencies
-        // This allows rustc to find transitive .rlib files
-        // Wrap nix_var in ${...} for Nix interpolation in multiline strings
+        // Add -L library search paths for ALL dependencies (direct and transitive).
+        // This is required because when rustc loads a dependency's rlib (e.g., http),
+        // it needs to resolve THAT crate's dependencies (e.g., bytes) via -L search paths.
+        // Even if bytes is also a direct dep with --extern, we still need -L for rustc
+        // to find it when loading http's metadata.
+        //
+        // Add -L for direct deps first
         for dep in &self.deps {
             script.push_str("  -L ");
             script.push_str(&format!("dependency=${{{}}}/lib", dep.nix_var));
             script.push_str(" \\\n");
         }
+        // Add -L for transitive deps (lib_search_deps)
+        for (lib_dep, _lib_name) in &self.lib_search_deps {
+            script.push_str("  -L ");
+            script.push_str(&format!("dependency=${{{}}}/lib", lib_dep));
+            script.push_str(" \\\n");
+        }
+
+        // Proc-macro crates need --extern proc_macro (compiler-provided crate)
+        if self.is_proc_macro {
+            script.push_str("  --extern proc_macro \\\n");
+        }
 
         // Add --extern flags for each dependency
+        // Note: extern_crate_name is the alias (used in --extern name=), while
+        // lib_name is the actual library filename on disk (used in path to .rlib)
         for dep in &self.deps {
             script.push_str("  --extern ");
             // Determine the library file name based on whether it's a proc-macro
             // Wrap nix_var in ${...} for Nix interpolation
             let lib_file = if dep.is_proc_macro {
                 // Proc-macros are shared libraries (.so on Linux, .dylib on macOS)
-                // Look specifically for dylib/so files, not .rmeta or .d files
+                // The filename includes the identity hash: lib{name}-{hash}.so/dylib
                 format!(
-                    "{}=\"$(find ${{{}}}/lib -type f \\( -name 'lib{}.so' -o -name 'lib{}.dylib' \\) | head -1)\"",
+                    "{}=\"$(find ${{{}}}/lib -type f \\( -name 'lib{}-{}.so' -o -name 'lib{}-{}.dylib' \\) | head -1)\"",
                     dep.extern_crate_name,
                     dep.nix_var,
-                    dep.extern_crate_name.replace('-', "_"),
-                    dep.extern_crate_name.replace('-', "_")
+                    dep.lib_name,
+                    dep.identity_hash,
+                    dep.lib_name,
+                    dep.identity_hash
                 )
             } else {
                 // Regular dependencies use .rlib
+                // Use lib_name (actual crate name) for the file path, extern_crate_name (alias) for --extern
+                // The filename includes the identity hash: lib{name}-{hash}.rlib
                 format!(
-                    "{}=${{{}}}/lib/lib{}.rlib",
-                    dep.extern_crate_name,
-                    dep.nix_var,
-                    dep.extern_crate_name.replace('-', "_")
+                    "{}=${{{}}}/lib/lib{}-{}.rlib",
+                    dep.extern_crate_name, dep.nix_var, dep.lib_name, dep.identity_hash
                 )
             };
             script.push_str(&lib_file);
@@ -559,7 +677,9 @@ impl NixGenerator {
 
         // Function signature
         // Always include hostRustToolchain with default for compatibility with lib.nix
-        out.push_str("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:\n\n");
+        // extraNativeBuildInputs allows passing protobuf, cmake, etc. for build scripts
+        // vendorDir allows passing pre-vendored crate sources for registry deps
+        out.push_str("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src, extraNativeBuildInputs ? [], vendorDir ? null }:\n\n");
 
         // Let block
         out.push_str("let\n");
@@ -573,45 +693,111 @@ impl NixGenerator {
         // Pre-compute derivation names for all units (needed for dependency resolution)
         let drv_names: Vec<String> = graph.units.iter().map(|u| u.derivation_name()).collect();
 
-        // First pass: identify build script units and generate their compile/run derivations
-        // Build a map from unit index -> BuildScriptRef for units that depend on build scripts
-        let mut build_script_derivations: Vec<String> = Vec::new();
+        // Compute transitive dependencies for each unit
+        // This is needed for -L library search paths (rustc needs to find all transitive rlibs)
+        let transitive_deps: Vec<std::collections::HashSet<usize>> = {
+            use std::collections::HashSet;
+
+            // Build direct dependency map (unit index -> Vec of dep indices)
+            let direct_deps: Vec<Vec<usize>> = graph
+                .units
+                .iter()
+                .map(|unit| {
+                    unit.dependencies
+                        .iter()
+                        .filter_map(|d| {
+                            // Skip build script run units for transitive deps
+                            graph
+                                .units
+                                .get(d.index)
+                                .filter(|dep_unit| dep_unit.mode != "run-custom-build")
+                                .map(|_| d.index)
+                        })
+                        .collect()
+                })
+                .collect();
+
+            // Compute transitive closure for each unit using DFS
+            fn transitive_closure(
+                unit_idx: usize,
+                direct_deps: &[Vec<usize>],
+                cache: &mut Vec<Option<HashSet<usize>>>,
+            ) -> HashSet<usize> {
+                if let Some(cached) = &cache[unit_idx] {
+                    return cached.clone();
+                }
+
+                let mut result = HashSet::new();
+                for &dep_idx in &direct_deps[unit_idx] {
+                    result.insert(dep_idx);
+                    // Recursively add transitive deps
+                    let trans = transitive_closure(dep_idx, direct_deps, cache);
+                    result.extend(trans);
+                }
+                cache[unit_idx] = Some(result.clone());
+                result
+            }
+
+            let mut cache: Vec<Option<HashSet<usize>>> = vec![None; graph.units.len()];
+            (0..graph.units.len())
+                .map(|i| transitive_closure(i, &direct_deps, &mut cache))
+                .collect()
+        };
+
+        // First pass: identify build script RUN units and their corresponding COMPILE units
+        // Build a map from run unit index -> BuildScriptRef for units that depend on build scripts
+        //
+        // Build scripts appear as two units in the graph:
+        // 1. COMPILE unit: mode="build", kind=["custom-build"] - compiles build.rs with its deps
+        // 2. RUN unit: mode="run-custom-build" - executes the compiled binary
+        //
+        // The RUN unit depends on the COMPILE unit. We process COMPILE units as normal
+        // derivations (to get their dependencies like tonic-build), and generate special
+        // RUN derivations that execute the binary and capture cargo: directives.
+        let mut build_script_run_derivations: Vec<String> = Vec::new();
         let mut build_script_refs: std::collections::HashMap<usize, BuildScriptRef> =
             std::collections::HashMap::new();
 
         for (i, unit) in graph.units.iter().enumerate() {
             if unit.mode == "run-custom-build" {
-                // This is a build script execution unit
-                let info = BuildScriptInfo::from_unit(
-                    unit,
-                    &self.config.workspace_root,
-                    self.config.content_addressed,
-                );
-                if let Some(info) = info {
-                    // Generate compile derivation
-                    build_script_derivations.push(format!(
-                        "    \"{}\" = mkUnit {};\n",
-                        info.compile_drv_name,
-                        info.compile_derivation()
-                    ));
+                // This is a build script RUN unit - find its compile unit dependency
+                // The compile unit will be processed as a normal derivation in the main loop
+                // Find the COMPILE unit (mode="build", kind=["custom-build"]), not another
+                // run-custom-build unit which also has kind=["custom-build"]
+                let compile_dep = unit.dependencies.iter().find(|dep| {
+                    graph.units.get(dep.index).is_some_and(|u| {
+                        u.mode == "build" && u.target.kind.contains(&"custom-build".to_string())
+                    })
+                });
 
-                    // Generate run derivation (depends on compile derivation)
-                    let compile_var = format!("units.\"{}\"", info.compile_drv_name);
-                    build_script_derivations.push(format!(
-                        "    \"{}\" = mkUnit {};\n",
-                        info.run_drv_name,
-                        info.run_derivation(&compile_var)
-                    ));
+                if let Some(compile_dep) = compile_dep {
+                    let compile_drv_name = drv_names[compile_dep.index].clone();
 
-                    // Store the reference for units that depend on this build script
-                    build_script_refs.insert(
-                        i,
-                        BuildScriptRef {
-                            run_drv_var: format!("units.\"{}\"", info.run_drv_name),
-                            compile_drv_name: info.compile_drv_name,
-                            run_drv_name: info.run_drv_name,
-                        },
+                    // Generate RUN derivation name
+                    let info = BuildScriptInfo::from_unit(
+                        unit,
+                        &self.config.workspace_root,
+                        self.config.content_addressed,
                     );
+                    if let Some(info) = info {
+                        // Generate run derivation (depends on compile derivation)
+                        let compile_var = format!("units.\"{}\"", compile_drv_name);
+                        build_script_run_derivations.push(format!(
+                            "    \"{}\" = mkUnit {};\n",
+                            info.run_drv_name,
+                            info.run_derivation(&compile_var)
+                        ));
+
+                        // Store the reference for units that depend on this build script
+                        build_script_refs.insert(
+                            i,
+                            BuildScriptRef {
+                                run_drv_var: format!("units.\"{}\"", info.run_drv_name),
+                                compile_drv_name,
+                                run_drv_name: info.run_drv_name,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -619,8 +805,9 @@ impl NixGenerator {
         // Generate derivations for each unit
         out.push_str("  units = {\n");
 
-        // First, output all build script derivations
-        for drv_str in &build_script_derivations {
+        // First, output all build script RUN derivations
+        // (COMPILE derivations are generated as normal units in the main loop)
+        for drv_str in &build_script_run_derivations {
             out.push_str(drv_str);
             out.push('\n');
         }
@@ -653,14 +840,32 @@ impl NixGenerator {
                     }
 
                     let dep_drv_name = &drv_names[dep.index];
+                    // Get the actual library name from the dependency unit's target
+                    // This is the filename used for the .rlib (may differ from extern_crate_name if renamed)
+                    let lib_name = dep_unit.target.name.replace('-', "_");
                     drv.add_dep(DepRef {
                         nix_var: format!("units.\"{}\"", dep_drv_name),
                         extern_crate_name: dep.extern_crate_name.clone(),
+                        lib_name,
+                        identity_hash: dep_unit.identity_hash(),
                         derivation_name: dep_drv_name.clone(),
                         is_proc_macro: dep_unit.is_proc_macro(),
                     });
                 }
             }
+
+            // Set lib search deps (transitive closure for -L flags)
+            // Include (nix_var, lib_name) so we can filter out direct deps by name
+            let lib_deps: Vec<(String, String)> = transitive_deps[i]
+                .iter()
+                .filter_map(|&idx| {
+                    let dep_unit = graph.units.get(idx)?;
+                    let nix_var = format!("units.\"{}\"", drv_names[idx]);
+                    let lib_name = dep_unit.target.name.replace('-', "_");
+                    Some((nix_var, lib_name))
+                })
+                .collect();
+            drv.set_lib_search_deps(lib_deps);
 
             let drv_name = &drv.name;
 
@@ -878,7 +1083,7 @@ mod tests {
         let nix = generator.generate(&graph);
 
         // Check structure
-        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"));
+        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src, extraNativeBuildInputs ? [], vendorDir ? null }:"));
         assert!(nix.contains("mkUnit = attrs:"));
         assert!(nix.contains("units = {"));
         assert!(nix.contains("roots = ["));
@@ -947,14 +1152,14 @@ mod tests {
         // Should have bin output in installPhase
         assert!(nix.contains("cp build/app $out/bin/"));
 
-        // Should have --extern flag for dependency
+        // Should have --extern flag for dependency (with identity hash in filename)
         assert!(nix.contains("--extern"));
         assert!(nix.contains("dep="));
-        assert!(nix.contains("/lib/libdep.rlib"));
+        // Library files include identity hash: libdep-{hash}.rlib
+        assert!(nix.contains("/lib/libdep-") && nix.contains(".rlib"));
 
-        // Should have -L flag for library search path
-        assert!(nix.contains("-L"));
-        assert!(nix.contains("dependency="));
+        // -L flags are NOT added for direct deps (they're covered by --extern with explicit path)
+        // This test only has one direct dep, so no -L flags are generated
     }
 
     #[test]
@@ -1034,8 +1239,8 @@ mod tests {
         assert!(nix.contains("serde="));
         assert!(nix.contains("serde_derive="));
 
-        // Regular lib dep should use .rlib
-        assert!(nix.contains("libserde.rlib"));
+        // Regular lib dep should use .rlib (with identity hash in filename)
+        assert!(nix.contains("libserde-") && nix.contains(".rlib"));
 
         // Proc-macro dep should use find for dynamic lib
         assert!(nix.contains("find") && nix.contains("serde_derive"));
@@ -1055,6 +1260,7 @@ mod tests {
             is_test: false,
             is_proc_macro: false,
             deps: vec![],
+            lib_search_deps: vec![],
             build_script_ref: None,
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
@@ -1065,6 +1271,8 @@ mod tests {
         drv.add_dep(DepRef {
             nix_var: "units.\"dep-0.1.0-xyz789\"".to_string(),
             extern_crate_name: "dep".to_string(),
+            lib_name: "dep".to_string(),
+            identity_hash: "xyz789".to_string(),
             derivation_name: "dep-0.1.0-xyz789".to_string(),
             is_proc_macro: false,
         });
@@ -1200,6 +1408,10 @@ mod tests {
     #[test]
     fn test_build_script_output_wiring() {
         // Test a unit graph where a library depends on a build script
+        // Real cargo output has THREE units for build scripts:
+        // 1. COMPILE unit: mode="build", kind=["custom-build"] - compiles build.rs
+        // 2. RUN unit: mode="run-custom-build" - executes the compiled binary
+        // 3. LIB unit: depends on RUN unit for build script outputs
         let json = r#"{
             "version": 1,
             "units": [
@@ -1214,8 +1426,24 @@ mod tests {
                     },
                     "profile": {"name": "dev", "opt_level": "0"},
                     "features": ["feature-x"],
-                    "mode": "run-custom-build",
+                    "mode": "build",
                     "dependencies": []
+                },
+                {
+                    "pkg_id": "my-crate 0.1.0 (path+file:///workspace)",
+                    "target": {
+                        "kind": ["custom-build"],
+                        "crate_types": ["bin"],
+                        "name": "build-script-build",
+                        "src_path": "/workspace/build.rs",
+                        "edition": "2021"
+                    },
+                    "profile": {"name": "dev", "opt_level": "0"},
+                    "features": ["feature-x"],
+                    "mode": "run-custom-build",
+                    "dependencies": [
+                        {"index": 0, "extern_crate_name": "build_script_build", "public": false}
+                    ]
                 },
                 {
                     "pkg_id": "my-crate 0.1.0 (path+file:///workspace)",
@@ -1230,11 +1458,11 @@ mod tests {
                     "features": ["feature-x"],
                     "mode": "build",
                     "dependencies": [
-                        {"index": 0, "extern_crate_name": "build_script_build", "public": false}
+                        {"index": 1, "extern_crate_name": "build_script_build", "public": false}
                     ]
                 }
             ],
-            "roots": [1]
+            "roots": [2]
         }"#;
 
         let graph = parse_unit_graph(json);
@@ -1247,24 +1475,44 @@ mod tests {
         let generator = NixGenerator::new(config);
         let nix = generator.generate(&graph);
 
-        // Should have build script compile derivation
-        assert!(nix.contains("my-crate-build-script-"));
-        assert!(nix.contains("pname = \"my-crate-build-script\""));
+        // Should have build script compile derivation (now uses target name "build-script-build")
+        assert!(
+            nix.contains("pname = \"build-script-build\""),
+            "missing build script compile derivation"
+        );
 
         // Should have build script run derivation
-        assert!(nix.contains("my-crate-build-script-run-"));
-        assert!(nix.contains("pname = \"my-crate-build-script-output\""));
+        assert!(
+            nix.contains("my-crate-build-script-run-"),
+            "missing build script run derivation name"
+        );
+        assert!(
+            nix.contains("pname = \"my-crate-build-script-output\""),
+            "missing build script output pname"
+        );
 
         // The library should read build script outputs
-        assert!(nix.contains("BUILD_SCRIPT_FLAGS"));
-        assert!(nix.contains("# Read build script outputs"));
-        assert!(nix.contains("rustc-cfg"));
+        assert!(
+            nix.contains("BUILD_SCRIPT_FLAGS"),
+            "missing BUILD_SCRIPT_FLAGS"
+        );
+        assert!(
+            nix.contains("# Read build script outputs"),
+            "missing build script outputs comment"
+        );
+        assert!(nix.contains("rustc-cfg"), "missing rustc-cfg handling");
 
         // Library build phase should include $BUILD_SCRIPT_FLAGS
-        assert!(nix.contains("$BUILD_SCRIPT_FLAGS"));
+        assert!(
+            nix.contains("$BUILD_SCRIPT_FLAGS"),
+            "missing $BUILD_SCRIPT_FLAGS in build phase"
+        );
 
         // Library should have build script run derivation in buildInputs
-        assert!(nix.contains("my-crate-build-script-run-"));
+        assert!(
+            nix.contains("my-crate-build-script-run-"),
+            "missing build script run derivation reference"
+        );
     }
 
     #[test]
@@ -1281,6 +1529,7 @@ mod tests {
             is_test: false,
             is_proc_macro: false,
             deps: vec![],
+            lib_search_deps: vec![],
             build_script_ref: Some(BuildScriptRef {
                 run_drv_var: "units.\"my-build-script-run\"".to_string(),
                 compile_drv_name: "my-build-script".to_string(),
@@ -1295,6 +1544,8 @@ mod tests {
         drv.add_dep(DepRef {
             nix_var: "units.\"dep-0.1.0-xyz789\"".to_string(),
             extern_crate_name: "dep".to_string(),
+            lib_name: "dep".to_string(),
+            identity_hash: "xyz789".to_string(),
             derivation_name: "dep-0.1.0-xyz789".to_string(),
             is_proc_macro: false,
         });
@@ -1366,7 +1617,7 @@ mod tests {
         let nix = NixGenerator::new(config).generate(&graph);
 
         // Should use rustToolchain for both (hostRustToolchain is in signature but defaults to rustToolchain)
-        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:"));
+        assert!(nix.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src, extraNativeBuildInputs ? [], vendorDir ? null }:"));
         // Proc-macro should use rustToolchain when not cross-compiling
         assert!(nix.contains("nativeBuildInputs = [ rustToolchain ]"));
         // Should NOT have hostRustToolchain in nativeBuildInputs when not cross-compiling
@@ -1385,7 +1636,7 @@ mod tests {
         // Should have hostRustToolchain in function signature
         assert!(nix_cross.contains("hostRustToolchain"));
         assert!(
-            nix_cross.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src }:")
+            nix_cross.contains("{ pkgs, rustToolchain, hostRustToolchain ? rustToolchain, src, extraNativeBuildInputs ? [], vendorDir ? null }:")
         );
 
         // Proc-macro should use hostRustToolchain
