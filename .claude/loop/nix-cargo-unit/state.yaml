@@ -120,7 +120,7 @@ features:
     depends_on: [12]
     relevant_files:
       - "@nix/lib.nix"
-    status: pending
+    status: in_progress
     block_count: 0
 
   - id: 14

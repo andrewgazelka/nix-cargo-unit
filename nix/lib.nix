@@ -19,6 +19,102 @@
 let
   inherit (pkgs) lib;
 
+  # Filter source to only include Rust-relevant files using lib.fileset
+  #
+  # This reduces the input hash for each derivation, improving cache hits.
+  # Changes to non-Rust files (docs, CI configs, etc.) won't invalidate builds.
+  #
+  # Arguments:
+  #   src: The source tree to filter
+  #   extraPaths: Additional paths to include (e.g., build.rs locations)
+  filterRustSource =
+    {
+      src,
+      extraPaths ? [ ],
+    }:
+    let
+      # Create a fileset from a path, returning null if it doesn't exist
+      # This handles optional files like Cargo.lock gracefully
+      optionalPath = path: lib.fileset.maybeMissing path;
+
+      # Standard Rust source patterns
+      rustFilesets = [
+        # Cargo manifests and lock file
+        (optionalPath (src + "/Cargo.toml"))
+        (optionalPath (src + "/Cargo.lock"))
+        # Workspace Cargo.toml files in common locations
+        (optionalPath (src + "/crates"))
+        # Source directories
+        (optionalPath (src + "/src"))
+        # Build scripts at root
+        (optionalPath (src + "/build.rs"))
+        # Benches and tests
+        (optionalPath (src + "/benches"))
+        (optionalPath (src + "/tests"))
+        # Examples
+        (optionalPath (src + "/examples"))
+      ];
+
+      # Filter to only .rs, .toml, and build-related files
+      rustFilesFilter = lib.fileset.fileFilter (
+        file:
+        lib.any (ext: file.hasExt ext) [
+          "rs"
+          "toml"
+        ]
+        || file.name == "Cargo.lock"
+        || file.name == "build.rs"
+      ) src;
+
+      # Combine standard paths with extra paths and filter
+      allFilesets =
+        rustFilesets ++ (map (p: optionalPath (src + "/${p}")) extraPaths) ++ [ rustFilesFilter ];
+
+      # Filter out null values (non-existent paths) and create union
+      validFilesets = builtins.filter (x: x != null) allFilesets;
+    in
+    if validFilesets == [ ] then
+      src
+    else
+      lib.fileset.toSource {
+        root = src;
+        fileset = lib.fileset.unions validFilesets;
+      };
+
+  # Filter source for a specific crate within a workspace
+  #
+  # This is more aggressive filtering - only includes the specific crate's
+  # source directory plus workspace-level Cargo files.
+  #
+  # Arguments:
+  #   src: The workspace source tree
+  #   cratePath: Relative path to the crate (e.g., "crates/core")
+  filterCrateSource =
+    {
+      src,
+      cratePath,
+    }:
+    let
+      optionalPath = path: lib.fileset.maybeMissing path;
+
+      crateFilesets = [
+        # Workspace-level Cargo files
+        (optionalPath (src + "/Cargo.toml"))
+        (optionalPath (src + "/Cargo.lock"))
+        # The crate's entire directory
+        (optionalPath (src + "/${cratePath}"))
+      ];
+
+      validFilesets = builtins.filter (x: x != null) crateFilesets;
+    in
+    if validFilesets == [ ] then
+      src
+    else
+      lib.fileset.toSource {
+        root = src;
+        fileset = lib.fileset.unions validFilesets;
+      };
+
   # Generate the unit graph JSON from a cargo workspace
   #
   # This runs `cargo +nightly --unit-graph` and outputs the JSON to $out.
@@ -105,6 +201,8 @@ let
   #   crossCompile: Enable cross-compilation mode
   #   hostPlatform: Host platform triple
   #   targetPlatform: Target platform triple
+  #   filterSource: Enable source filtering to reduce input hash (default: true)
+  #   extraSourcePaths: Additional paths to include when filtering (e.g., ["proto", "assets"])
   buildWorkspace =
     {
       src,
@@ -116,21 +214,31 @@ let
       crossCompile ? false,
       hostPlatform ? null,
       targetPlatform ? null,
+      filterSource ? true,
+      extraSourcePaths ? [ ],
     }:
     let
+      # Apply source filtering if enabled
+      # This reduces the input hash by excluding non-Rust files
+      filteredSrc =
+        if filterSource then
+          filterRustSource {
+            src = src;
+            extraPaths = extraSourcePaths;
+          }
+        else
+          src;
+
       # Step 1: Generate unit graph JSON (IFD step 1)
+      # Use filtered source for unit graph generation
       unitGraphJson = generateUnitGraph {
-        inherit
-          src
-          rustToolchain
-          cargoArgs
-          profile
-          ;
+        src = filteredSrc;
+        inherit rustToolchain cargoArgs profile;
       };
 
       # Get the absolute workspace root path as a string for source remapping
-      # In Nix, we use the src derivation path
-      workspaceRoot = toString src;
+      # Use the filtered source path for consistent remapping
+      workspaceRoot = toString filteredSrc;
 
       # Step 2: Generate Nix expressions from unit graph (IFD step 2)
       unitsNix = generateNixFromUnitGraph {
@@ -146,9 +254,11 @@ let
 
       # Step 3: Import the generated Nix (IFD - Import From Derivation)
       # This is where the magic happens - Nix evaluates a derivation output
+      # Pass filtered source to the generated derivations
       units = import unitsNix {
-        inherit pkgs rustToolchain src;
+        inherit pkgs rustToolchain;
         inherit hostRustToolchain;
+        src = filteredSrc;
       };
     in
     {
@@ -163,6 +273,9 @@ let
 
       # Expose the intermediate derivations for debugging
       inherit unitGraphJson unitsNix;
+
+      # Expose the filtered source for inspection
+      inherit filteredSrc;
     };
 
   # Build a single crate (non-workspace) using IFD
@@ -183,6 +296,9 @@ in
     generateNixFromUnitGraph
     buildWorkspace
     buildCrate
+    # Source filtering utilities
+    filterRustSource
+    filterCrateSource
     ;
 
   # Make the library callable directly
