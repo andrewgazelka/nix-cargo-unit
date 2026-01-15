@@ -574,8 +574,17 @@ export CARGO_CFG_UNIX
         // Use a temporary file to avoid pipefail issues with failing build scripts
         // NOTE: We cd to CARGO_MANIFEST_DIR because some build scripts read Cargo.toml
         // from the current directory rather than from CARGO_MANIFEST_DIR env var
+        //
+        // For CA derivations: if $out already exists and has files, it means we're
+        // reusing a previous build's output. In that case, exit early since the
+        // content is already correct (verified by hash).
         script.push_str(&format!(
-            "\n# Run build script from package directory (some read Cargo.toml from cwd)\n\
+            "\n# CA derivation check: if output already exists with content, skip rebuild\n\
+            if [ -f \"$out/rustc-cfg\" ] && [ ! -w \"$out\" ]; then\n\
+              echo \"CA derivation output already exists, skipping build script run\"\n\
+              exit 0\n\
+            fi\n\n\
+            # Run build script from package directory (some read Cargo.toml from cwd)\n\
             cd \"$CARGO_MANIFEST_DIR\"\n\
             BUILD_SCRIPT_OUTPUT=$(mktemp)\n\
             set +e\n\
