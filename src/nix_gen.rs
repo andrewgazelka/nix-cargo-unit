@@ -412,6 +412,10 @@ pub struct UnitDerivation {
     /// Tuple of (nix_var, lib_name) - e.g., ("units.\"foo-1.0.0-hash\"", "foo")
     pub lib_search_deps: Vec<(String, String)>,
 
+    /// Crate names that have conflicting versions in the transitive closure.
+    /// These should NOT get --extern flags; rustc will find them via -L search.
+    pub conflicting_crates: rustc_hash::FxHashSet<String>,
+
     /// Build script outputs this unit depends on (if any).
     pub build_script_ref: Option<BuildScriptRef>,
 
@@ -482,6 +486,7 @@ impl UnitDerivation {
             is_proc_macro: unit.is_proc_macro(),
             deps: Vec::new(),
             lib_search_deps: Vec::new(),
+            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: None,
             rustc_flags,
             content_addressed,
@@ -502,6 +507,11 @@ impl UnitDerivation {
     /// Sets the library search dependencies (transitive deps for -L flags).
     pub fn set_lib_search_deps(&mut self, deps: Vec<(String, String)>) {
         self.lib_search_deps = deps;
+    }
+
+    /// Sets the conflicting crate names that should NOT get --extern flags.
+    pub fn set_conflicting_crates(&mut self, crates: rustc_hash::FxHashSet<String>) {
+        self.conflicting_crates = crates;
     }
 
     /// Generates the Nix derivation expression.
@@ -651,7 +661,18 @@ impl UnitDerivation {
         // Add --extern flags for each dependency
         // Note: extern_crate_name is the alias (used in --extern name=), while
         // lib_name is the actual library filename on disk (used in path to .rlib)
+        //
+        // IMPORTANT: Skip --extern for crates that have conflicting versions in the
+        // transitive closure. These crates appear multiple times with different hashes
+        // (e.g., due to feature divergence). Let rustc find them via -L search paths
+        // instead, which will match the correct version based on SVH.
         for dep in &self.deps {
+            // Skip non-proc-macro deps that have conflicting versions
+            // (proc-macros always need explicit --extern to load the dylib)
+            if !dep.is_proc_macro && self.conflicting_crates.contains(&dep.lib_name) {
+                continue;
+            }
+
             script.push_str("  --extern ");
             if dep.is_proc_macro {
                 // Proc-macros use the variable set above
@@ -829,8 +850,55 @@ impl NixGenerator {
         out.push_str("  });\n\n");
 
         // Pre-compute identity hashes and derivation names for all units (needed for dependency resolution)
-        // Computing these upfront avoids redundant SHA-256 computations
-        let identity_hashes: Vec<String> = graph.units.iter().map(|u| u.identity_hash()).collect();
+        //
+        // CRITICAL: Hashes must be computed in TOPOLOGICAL ORDER with dependency hashes included!
+        // This ensures rustc unification works correctly - when a dependency's hash changes,
+        // all dependents' hashes also change, matching how rustc embeds SVH into rlib metadata.
+        let identity_hashes: Vec<String> = {
+            let mut hashes: Vec<Option<String>> = vec![None; graph.units.len()];
+
+            // Compute in topological order using DFS
+            fn compute_hash(
+                idx: usize,
+                graph: &UnitGraph,
+                hashes: &mut [Option<String>],
+            ) -> String {
+                if let Some(ref h) = hashes[idx] {
+                    return h.clone();
+                }
+
+                // First, compute hashes for all dependencies (recursively)
+                let unit = &graph.units[idx];
+                let dep_hashes: Vec<String> = unit
+                    .dependencies
+                    .iter()
+                    .filter_map(|dep| {
+                        // Skip build script run units - they don't contribute to binary identity
+                        graph.units.get(dep.index).and_then(|dep_unit| {
+                            if dep_unit.mode == "run-custom-build" {
+                                None
+                            } else {
+                                Some(compute_hash(dep.index, graph, hashes))
+                            }
+                        })
+                    })
+                    .collect();
+
+                // Now compute this unit's hash with dependency hashes included
+                let dep_refs: Vec<&str> = dep_hashes.iter().map(String::as_str).collect();
+                let hash = unit.identity_hash_with_deps(&dep_refs);
+                hashes[idx] = Some(hash.clone());
+                hash
+            }
+
+            // Compute hashes for all units
+            for i in 0..graph.units.len() {
+                compute_hash(i, graph, &mut hashes);
+            }
+
+            hashes.into_iter().map(|h| h.unwrap()).collect()
+        };
+
         let drv_names: Vec<String> = graph
             .units
             .iter()
@@ -1092,6 +1160,34 @@ impl NixGenerator {
                 .collect();
             drv.set_lib_search_deps(lib_deps);
 
+            // Detect conflicting crates: same lib_name but different identity hashes
+            // in the transitive closure. These should NOT get --extern flags because
+            // different deps may need different versions (e.g., due to feature divergence).
+            let mut lib_name_to_hashes: rustc_hash::FxHashMap<String, Vec<String>> =
+                rustc_hash::FxHashMap::default();
+            for &idx in transitive_deps[i].iter() {
+                if let Some(dep_unit) = graph.units.get(idx) {
+                    let lib_name = dep_unit.target.name.replace('-', "_");
+                    lib_name_to_hashes
+                        .entry(lib_name)
+                        .or_default()
+                        .push(identity_hashes[idx].clone());
+                }
+            }
+            let conflicting: rustc_hash::FxHashSet<String> = lib_name_to_hashes
+                .into_iter()
+                .filter_map(|(lib_name, hashes)| {
+                    // Conflicting if there are multiple UNIQUE hashes
+                    let unique: rustc_hash::FxHashSet<_> = hashes.into_iter().collect();
+                    if unique.len() > 1 {
+                        Some(lib_name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            drv.set_conflicting_crates(conflicting);
+
             let drv_name = &drv.name;
 
             out.push_str(&format!("    \"{}\" = mkUnit ", drv_name));
@@ -1111,12 +1207,11 @@ impl NixGenerator {
         out.push_str("in {\n");
         out.push_str("  inherit units;\n");
 
-        // Root units
+        // Root units - use precomputed drv_names for consistency with dep-aware hashes
         let root_refs: Vec<String> = graph
             .roots
             .iter()
-            .filter_map(|&i| graph.units.get(i))
-            .map(|u| format!("units.\"{}\"", u.derivation_name()))
+            .map(|&i| format!("units.\"{}\"", &drv_names[i]))
             .collect();
 
         out.push_str(&format!("  roots = [ {} ];\n", root_refs.join(" ")));
@@ -1128,7 +1223,7 @@ impl NixGenerator {
         for &root_idx in &graph.roots {
             if let Some(unit) = graph.units.get(root_idx) {
                 let target_name = &unit.target.name;
-                let drv_name = unit.derivation_name();
+                let drv_name = &drv_names[root_idx];
                 out.push_str(&format!(
                     "    \"{}\" = units.\"{}\";\n",
                     escape_nix_string(target_name),
@@ -1146,7 +1241,7 @@ impl NixGenerator {
                 && unit.is_bin()
             {
                 let target_name = &unit.target.name;
-                let drv_name = unit.derivation_name();
+                let drv_name = &drv_names[root_idx];
                 out.push_str(&format!(
                     "    \"{}\" = units.\"{}\";\n",
                     escape_nix_string(target_name),
@@ -1164,7 +1259,7 @@ impl NixGenerator {
                 && (unit.is_lib() || unit.is_proc_macro())
             {
                 let target_name = &unit.target.name;
-                let drv_name = unit.derivation_name();
+                let drv_name = &drv_names[root_idx];
                 out.push_str(&format!(
                     "    \"{}\" = units.\"{}\";\n",
                     escape_nix_string(target_name),
@@ -1175,12 +1270,10 @@ impl NixGenerator {
         out.push_str("  };\n");
 
         // Convenience: default is the first root
-        if let Some(&first_root) = graph.roots.first()
-            && let Some(unit) = graph.units.get(first_root)
-        {
+        if let Some(&first_root) = graph.roots.first() {
             out.push_str(&format!(
                 "\n  default = units.\"{}\";\n",
-                unit.derivation_name()
+                &drv_names[first_root]
             ));
         }
 
@@ -1498,6 +1591,7 @@ mod tests {
             is_proc_macro: false,
             deps: vec![],
             lib_search_deps: vec![],
+            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: None,
             rustc_flags: RustcFlags::new(),
             content_addressed: false,
@@ -1797,6 +1891,7 @@ mod tests {
             is_proc_macro: false,
             deps: vec![],
             lib_search_deps: vec![],
+            conflicting_crates: rustc_hash::FxHashSet::default(),
             build_script_ref: Some(BuildScriptRef {
                 run_drv_var: "units.\"my-build-script-run\"".to_string(),
                 compile_drv_name: "my-build-script".to_string(),

@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = [".", "my-macro", "shared-lib"]
+
+[package]
+name = "dep-repro"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+my-macro = { path = "my-macro" }
+shared-lib = { path = "shared-lib", features = ["feature-b"] }
+serde = { version = "1.0", features = ["derive", "rc"] }  # rc feature
+
+[profile.release]
+lto = false

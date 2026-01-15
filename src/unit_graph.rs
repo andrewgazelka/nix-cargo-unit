@@ -499,9 +499,32 @@ impl Unit {
     /// This can be used as a unique derivation key since the same package can appear
     /// multiple times with different features or profiles.
     ///
+    /// **IMPORTANT**: This method does NOT include dependency hashes. Use `identity_hash_with_deps`
+    /// for proper rustc unification (computed in topological order in nix_gen.rs).
+    ///
     /// Returns a 16-character hex string (first 64 bits of SHA-256).
     #[must_use]
     pub fn identity_hash(&self) -> String {
+        self.identity_hash_with_deps(&[])
+    }
+
+    /// Computes a unique identity hash for this unit, including dependency hashes.
+    ///
+    /// The identity is a SHA-256 hash of:
+    /// - pkg_id, sorted features, profile key fields, mode, target name, crate types
+    /// - **Sorted dependency hashes** (critical for rustc unification!)
+    ///
+    /// When rustc compiles a crate, it embeds the "strict version hash" (SVH) of all dependencies
+    /// into the rlib metadata. Later, when loading that rlib, rustc must find dependencies with
+    /// exactly matching SVH. Our identity hash must mirror this behavior: if a dependency's hash
+    /// changes, all dependents' hashes must also change.
+    ///
+    /// The `dep_hashes` parameter should contain the already-computed identity hashes of this
+    /// unit's direct dependencies. This requires computing hashes in topological order.
+    ///
+    /// Returns a 16-character hex string (first 64 bits of SHA-256).
+    #[must_use]
+    pub fn identity_hash_with_deps(&self, dep_hashes: &[&str]) -> String {
         use sha2::Digest as _;
 
         let mut hasher = sha2::Sha256::new();
@@ -582,6 +605,18 @@ impl Unit {
             hasher.update(platform.as_bytes());
         }
         hasher.update(b"\0");
+
+        // CRITICAL: Include dependency hashes for proper rustc unification!
+        // Sort for determinism (order in unit graph might vary)
+        if !dep_hashes.is_empty() {
+            let mut sorted_hashes: Vec<&str> = dep_hashes.to_vec();
+            sorted_hashes.sort();
+            hasher.update(b"deps:");
+            for h in sorted_hashes {
+                hasher.update(h.as_bytes());
+                hasher.update(b"\0");
+            }
+        }
 
         // Take first 8 bytes (16 hex chars) for a reasonably unique short ID
         let result = hasher.finalize();
