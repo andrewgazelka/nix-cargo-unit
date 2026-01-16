@@ -1,5 +1,7 @@
 # nix-cargo-unit Development Notes
 
+notes in ./.claude/notes
+
 ## CA Derivations - NEVER DISABLE
 NEVER remove `contentAddressed = true` as a workaround. Always debug and fix the root cause.
 We have a custom Nix at `~/Projects/nix` that we control - keep modifying it until CA works.
@@ -37,6 +39,13 @@ When generating rustc invocations:
 - Direct dependencies ALWAYS need `--extern` - never skip it even if there are version conflicts
 - Transitive deps (those only needed by your deps) are resolved via `-L` search based on SVH
 - Rustc uses SVH (Stable Version Hash) embedded in rlib metadata to match dependencies
+
+**CRITICAL**: `-L dependency` paths must include the FULL transitive closure, not just direct deps.
+When rustc loads crate A that depends on B, it verifies B's SVH. To verify B, rustc needs to
+locate B's dependencies (C, D, etc.) in -L paths. If any transitive dep is missing from -L paths,
+rustc fails with "can't find crate for 'A'" (misleading error - actual issue is missing transitive dep).
+
+See `.claude/notes/rustc-transitive-dep-resolution.md` for detailed investigation.
 
 ## Reference Code
 Useful:
